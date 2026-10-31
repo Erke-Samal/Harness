@@ -36,7 +36,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from solution.token_packing import TokenPacking, plan_token_packing
+from solution.token_packing import TokenPacking, plan_token_packing, set_active_packing
 
 # The attribute under which Soup's rewind recorder looks for per-token losses.
 _STEP_ATTR = "_soup_chunked_step"
@@ -401,7 +401,11 @@ def patch_chunked_ce_loss() -> None:
                 position_ids=torch.arange(packing.seq_len, device=device).unsqueeze(0),
                 token_packing=packing,
             )
-            outputs = self.model(**kwargs)
+            set_active_packing(packing)
+            try:
+                outputs = self.model(**kwargs)
+            finally:
+                set_active_packing(None)
 
         lm_head = self.lm_head
         loss, token_losses, token_entropies, correct, valid = triton_chunked_causal_lm_loss(

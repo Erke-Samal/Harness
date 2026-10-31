@@ -51,4 +51,4 @@ memory, quality), limits and next steps.
 
 ## Limitations
 See section 3 of the README: T4 numbers, fp16 gradients under the `GradScaler`, the two vocabulary
-passes, the vanilla single-adapter LoRA path, and our own LoRA dropout masks.
+passes, the vanilla single-adapter LoRA path, and the cost of redrawing LoRA dropout masks.

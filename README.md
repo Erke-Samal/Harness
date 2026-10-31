@@ -29,7 +29,7 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
 
 | Module | Kernels | What it does |
 |---|---|---|
-| `solution/nf4_triton.py` | `triton_nf4_dequant_kernel` | One launch for double-quantized NF4/FP4 unpacking: nested `absmax`, both nibbles, the codebook, pairs of fp16 written as one 32-bit word, into one reusable buffer. Autograd functions for `bnb.nn.Linear4bit` and the peft LoRA layer avoid `result.clone()` and keep the dropout mask in `uint8`. |
+| `solution/nf4_triton.py` | `triton_nf4_dequant_kernel` | One launch for double-quantized NF4/FP4 unpacking: nested `absmax`, both nibbles, the codebook, pairs of fp16 written as one 32-bit word, into one reusable buffer. Autograd functions for `bnb.nn.Linear4bit` and the peft LoRA layer avoid `result.clone()`. LoRA dropout stays peft's own, drawn from the default generator on the base's grid; backward redraws the same mask from the saved generator state instead of storing it. |
 | `solution/cross_entropy_triton.py` | `triton_vocab_ce_entropy_bwd_kernel` | Chunks of 32 positions in one reused workspace. One row pass gives cross-entropy, Shannon entropy and argmax by an online softmax; a second pass overwrites the chunk with `softmax - one_hot`. Full logits are never built on a training step. |
 | `solution/rmsnorm_triton.py` | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | RMSNorm in fp32 registers with output in the input's dtype, which stops the fp32 cascade. Saves its output, which the LoRA layers keep anyway, and a 1D `rstd`: backward gets `x / rms` as `y / weight`. |
 | `solution/rope_triton.py` | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | Q and K rotary embedding in one launch, reading the non-contiguous views directly. Backward saves only `cos` and `sin`. |
@@ -122,5 +122,5 @@ Limits:
    GPU queue. Measured on one run: 1793 calls, no overflow, largest gradient 323 of the fp16 limit
    65504.
 8. MLP gradients are rounded to int8 steps, so they are close to the base, not equal to it.
-9. LoRA dropout keeps its probability but draws its mask by our own code and redraws it from a seed in
-   backward, so masks differ from the base run.
+9. LoRA dropout draws on a whole `[B, S, W]` grid to keep the base's masks, so a packed step still
+   pays for drawing noise on padding, once in forward and once in backward.

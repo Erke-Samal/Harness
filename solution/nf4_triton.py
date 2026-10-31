@@ -13,7 +13,7 @@ with a single fused ``@triton.jit`` kernel ``triton_nf4_dequant_kernel`` that:
 Also provides custom autograd functions for ``bnb.nn.Linear4bit`` and
 ``peft.tuners.lora.bnb.Linear4bit`` that eliminate redundant fp32<->fp16 round-trip
 casts, remove the unnecessary ``result.clone()`` allocation in PEFT QLoRA forward,
-and use a compact uint8 mask for LoRA dropout.
+and redraw peft's LoRA dropout mask in backward instead of storing it.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from typing import Any, Optional
 import torch
 import triton
 import triton.language as tl
+
+from solution.token_packing import TokenPacking, active_packing
 
 _SHIFT_MAP = {
     32: 5,
@@ -220,16 +222,34 @@ def triton_dequantize_nf4(
     return out_fp16
 
 
-_DROPOUT_GENERATORS: dict[torch.device, torch.Generator] = {}
+def _default_generator(device: torch.device) -> torch.Generator:
+    if device.type == "cuda":
+        return torch.cuda.default_generators[device.index or 0]
+    return torch.default_generator
 
 
-def _dropout_factor(x: torch.Tensor, dropout_p: float, seed: int) -> torch.Tensor:
-    """LoRA dropout factors, redrawn from a seed so that backward stores no mask."""
-    generator = _DROPOUT_GENERATORS.setdefault(x.device, torch.Generator(device=x.device))
-    generator.manual_seed(seed)
-    keep_prob = 1.0 - dropout_p
-    keep = torch.rand(x.shape, generator=generator, device=x.device, dtype=torch.float32) < keep_prob
-    return keep.to(x.dtype) / keep_prob
+def _dropout_factor(dropout: torch.nn.Module, x: torch.Tensor, dtype: torch.dtype, packing: Optional[TokenPacking]) -> torch.Tensor:
+    """What peft's own LoRA dropout multiplies ``x`` by, drawn by it from the default generator.
+
+    The base draws on the ``[B, S, W]`` grid in the LoRA dtype, so this does too, and a packed step
+    then keeps its real tokens: the masks and the generator's state stay those of the base run.
+    """
+    width = x.shape[-1]
+    shape = (packing.batch, packing.seq_len, width) if packing is not None else x.shape
+    noise = dropout(torch.ones(shape, dtype=dtype, device=x.device)).view(-1, width)
+    if packing is not None:
+        noise = noise[packing.index]
+    return noise.to(x.dtype)
+
+
+def _redraw_dropout_factor(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+    """The same mask again for backward, from the state saved in forward, so no mask is stored."""
+    generator = _default_generator(x.device)
+    current = generator.get_state()
+    generator.set_state(ctx.rng_state)
+    factor = _dropout_factor(ctx.dropout, x, ctx.lora_dtype, ctx.packing)
+    generator.set_state(current)
+    return factor
 
 
 class _TritonBNBLinearFunction(torch.autograd.Function):
@@ -304,8 +324,8 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
         lora_A_weight: torch.Tensor,
         lora_B_weight: torch.Tensor,
         scaling: float,
-        dropout_p: float,
-        training: bool,
+        dropout: Optional[torch.nn.Module],
+        packing: Optional[TokenPacking],
     ) -> torch.Tensor:
         compute_dtype = torch.float16
         x_fp16 = x.to(compute_dtype) if x.dtype != compute_dtype else x
@@ -320,10 +340,12 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
             out_2d = out_2d + bias_cast
 
         # 2. LoRA branch (runs on fp16 Tensor Cores while keeping master lora_A/B in fp32)
-        dropout_seed = None
-        if training and dropout_p > 0.0:
-            dropout_seed = int(torch.randint(0, 2**31 - 1, (1,)))
-            x_dropped = x_2d * _dropout_factor(x_2d, dropout_p, dropout_seed)
+        ctx.dropout = dropout
+        if dropout is not None:
+            ctx.rng_state = _default_generator(x.device).get_state()
+            ctx.lora_dtype = lora_A_weight.dtype
+            ctx.packing = packing
+            x_dropped = x_2d * _dropout_factor(dropout, x_2d, lora_A_weight.dtype, packing)
         else:
             x_dropped = x_2d
 
@@ -337,8 +359,6 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
         ctx.save_for_backward(x_2d, h_a, qweight, lora_A_weight, lora_B_weight)
         ctx.quant_state = quant_state
         ctx.scaling = float(scaling)
-        ctx.dropout_p = float(dropout_p)
-        ctx.dropout_seed = dropout_seed
         ctx.input_dtype = x.dtype
         ctx.compute_dtype = compute_dtype
         ctx.has_bias = bias is not None
@@ -361,8 +381,8 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
         lora_A_fp16 = lora_A_weight.to(compute_dtype)
         lora_B_fp16 = lora_B_weight.to(compute_dtype)
 
-        if ctx.dropout_seed is not None:
-            drop_factor = _dropout_factor(x_2d, ctx.dropout_p, ctx.dropout_seed)
+        if ctx.dropout is not None:
+            drop_factor = _redraw_dropout_factor(ctx, x_2d)
             x_dropped = x_2d * drop_factor
         else:
             drop_factor = None
@@ -448,7 +468,7 @@ def _fast_peft_linear4bit_forward(self, x: torch.Tensor, *args: Any, **kwargs: A
     lora_A_mod = self.lora_A[active_adapter]
     lora_B_mod = self.lora_B[active_adapter]
     dropout_mod = self.lora_dropout[active_adapter]
-    dropout_p = float(getattr(dropout_mod, "p", 0.0)) if isinstance(dropout_mod, torch.nn.Dropout) else 0.0
+    dropping = isinstance(dropout_mod, torch.nn.Dropout) and dropout_mod.p > 0.0 and self.training and dropout_mod.training
     scaling = float(self.scaling[active_adapter])
 
     return _TritonQLoRALinearFunction.apply(
@@ -459,8 +479,8 @@ def _fast_peft_linear4bit_forward(self, x: torch.Tensor, *args: Any, **kwargs: A
         lora_A_mod.weight,
         lora_B_mod.weight,
         scaling,
-        dropout_p,
-        bool(self.training and dropout_mod.training),
+        dropout_mod if dropping else None,
+        active_packing() if dropping else None,
     )
 
 

@@ -6,13 +6,15 @@ Run on a CUDA machine (e.g., Kaggle Tesla T4):
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from solution.attention_triton import triton_causal_gqa_attention
 from solution.cross_entropy_triton import triton_chunked_causal_lm_loss
-from solution.nf4_triton import triton_dequantize_nf4
+from solution.nf4_triton import _default_generator, _dropout_factor, _redraw_dropout_factor, triton_dequantize_nf4
 from solution.rmsnorm_triton import triton_rmsnorm
 from solution.rope_triton import _pytorch_rope_fallback, triton_rope_qk
 from solution.swiglu import swiglu
@@ -233,6 +235,29 @@ def test_causal_gqa_attention_matches_sdpa(dtype: torch.dtype, seq_len: int) -> 
     torch.testing.assert_close(q.grad.float(), q_ref.grad, atol=atol, rtol=rtol)
     torch.testing.assert_close(k.grad.float(), k_ref.grad, atol=atol, rtol=rtol)
     torch.testing.assert_close(v.grad.float(), v_ref.grad, atol=atol, rtol=rtol)
+
+
+def test_lora_dropout_is_drawn_like_the_base_and_redrawn_in_backward() -> None:
+    dropout = torch.nn.Dropout(0.1)
+    mask = torch.zeros((3, 9), dtype=torch.bool, device="cuda")
+    for row, length in enumerate((9, 4, 6)):
+        mask[row, :length] = True
+    packing = TokenPacking(mask.view(-1).nonzero().squeeze(1), mask.sum(1, dtype=torch.int32), 3, 9)
+    x = torch.ones((packing.index.numel(), 16), dtype=torch.float16, device="cuda")
+
+    torch.manual_seed(5)
+    base = dropout(torch.ones((3, 9, 16), dtype=torch.float32, device="cuda"))
+    after_base = torch.cuda.get_rng_state()
+
+    torch.manual_seed(5)
+    state = _default_generator(x.device).get_state()
+    factor = _dropout_factor(dropout, x, torch.float32, packing)
+    assert torch.equal(torch.cuda.get_rng_state(), after_base)
+    assert torch.equal(factor, base[mask].to(torch.float16))
+
+    ctx = SimpleNamespace(dropout=dropout, rng_state=state, lora_dtype=torch.float32, packing=packing)
+    assert torch.equal(_redraw_dropout_factor(ctx, x), factor)
+    assert torch.equal(torch.cuda.get_rng_state(), after_base)
 
 
 def test_attention_on_a_padded_batch_matches_each_row_alone() -> None:

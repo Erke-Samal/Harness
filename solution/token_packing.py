@@ -28,6 +28,19 @@ class TokenPacking:
     seq_len: int
 
 
+_active_packing: Optional[TokenPacking] = None
+
+
+def set_active_packing(packing: Optional[TokenPacking]) -> None:
+    """Name the packing of the current forward, for layers that need the ``[B, S]`` grid."""
+    global _active_packing
+    _active_packing = packing
+
+
+def active_packing() -> Optional[TokenPacking]:
+    return _active_packing
+
+
 @triton.jit
 def triton_token_copy_kernel(
     Packed_ptr,

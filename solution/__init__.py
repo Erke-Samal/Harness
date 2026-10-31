@@ -91,12 +91,7 @@ def _patch_soup_sft_setup() -> None:
         return
 
     def _wrapped_setup_transformers(self, *args, **kwargs):
-        # Loading builds many long-lived objects and frees few: the collector only rescans them.
-        gc.disable()
-        try:
-            result = orig_setup(self, *args, **kwargs)
-        finally:
-            gc.enable()
+        result = orig_setup(self, *args, **kwargs)
         model = getattr(self, "model", None)
         if not isinstance(model, torch.nn.Module):
             return result
@@ -124,7 +119,6 @@ def _patch_soup_sft_setup() -> None:
         if cast_any:
             gc.collect()
             torch.cuda.empty_cache()
-        gc.freeze()  # the model never becomes garbage: training steps need not rescan it
 
         return result
 
@@ -132,18 +126,12 @@ def _patch_soup_sft_setup() -> None:
     soup_sft.SFTTrainerWrapper._setup_transformers = _wrapped_setup_transformers
 
 
-def _skip_repeated_startup_work() -> None:
-    """Two costs of ``soup train`` that buy nothing for a run in memory.
-
-    ``trl`` scans the files of every installed package at import, as ``transformers`` has already
-    done in this process, so it gets that same mapping. ``datasets`` hashes the mapped function and
-    its tokenizer to name a cache file that a dataset held in memory never uses.
-    """
-    import datasets
+def _reuse_package_scan() -> None:
+    """``trl`` scans the files of every installed package at import, as ``transformers`` has already
+    done in this process, so it gets that same mapping."""
     from transformers.utils import import_utils
 
     importlib.metadata.packages_distributions = lambda: import_utils.PACKAGE_DISTRIBUTION_MAPPING
-    datasets.disable_caching()
 
 
 def apply() -> None:
@@ -152,9 +140,8 @@ def apply() -> None:
     if _APPLIED:
         return
 
-    gc.disable()  # the imports below create objects that live until the process exits
     scan_packages = importlib.metadata.packages_distributions
-    _skip_repeated_startup_work()
+    _reuse_package_scan()
     patch_qwen2_mlp()
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
@@ -165,6 +152,5 @@ def apply() -> None:
     _patch_soup_sft_setup()
     start_compiling()
     importlib.metadata.packages_distributions = scan_packages
-    gc.enable()
 
     _APPLIED = True
