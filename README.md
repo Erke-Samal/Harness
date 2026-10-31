@@ -117,8 +117,10 @@ Limits:
 6. The matrix multiplies of attention still run on the `[B, S]` grid, so their cost follows the
    longest row of a batch; only the softmax follows the real lengths.
    Backward computes the weights a second time, which costs time to save memory.
-7. Attention sums in fp16 are less exact than the base's fp32. Backward redoes a layer in fp32 when
-   an overflow appears, and checks 6 and 7 compare the outputs with the base.
+7. Attention sums in fp16 are less exact than the base's fp32. An overflow in attention backward
+   would make the GradScaler skip that step; we dropped the per-layer check because it stalled the
+   GPU queue. Measured on one run: 1793 calls, no overflow, largest gradient 323 of the fp16 limit
+   65504.
 8. MLP gradients are rounded to int8 steps, so they are close to the base, not equal to it.
 9. LoRA dropout keeps its probability but draws its mask by our own code and redraws it from a seed in
    backward, so masks differ from the base run.

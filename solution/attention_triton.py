@@ -18,7 +18,6 @@ Milakov and Gimelshein (2018).
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -135,10 +134,6 @@ def _attention_vjp(
     return dq, dk, dv
 
 
-def _is_finite(*tensors: torch.Tensor) -> bool:
-    return bool(torch.isfinite(sum(t.sum(dtype=torch.float32) for t in tensors)))
-
-
 class _TritonCausalGQAFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, scaling, lengths):
@@ -162,16 +157,11 @@ class _TritonCausalGQAFunction(torch.autograd.Function):
         dy = dy.contiguous()
 
         # GradScaler gradients are large. A power of two keeps the fp16 sums in range without
-        # rounding, and a rare overflow is redone in fp32 instead of skipping the optimizer step.
-        peak = float(dy.abs().amax())
-        rescale = 1.0
-        if _MAX_FP16_GRAD < peak < math.inf:
-            rescale = 2.0 ** math.ceil(math.log2(peak / _MAX_FP16_GRAD))
+        # rounding. It stays on the GPU: reading it in Python would stall the queue on every layer.
+        low, high = dy.aminmax()
+        peak = torch.maximum(high, -low).float()
+        rescale = torch.pow(2.0, torch.ceil(torch.log2(peak / _MAX_FP16_GRAD))).clamp_min(1.0)
         dq, dk, dv = _attention_vjp(q_groups, k, v, dy / rescale, ctx.scaling, ctx.lengths)
-        if not _is_finite(dq, dk, dv):
-            dq, dk, dv = _attention_vjp(
-                q_groups.float(), k.float(), v.float(), dy.float() / rescale, ctx.scaling, ctx.lengths
-            )
         dq, dk, dv = (g.to(q.dtype) * rescale for g in (dq, dk, dv))
         return dq.view_as(q), dk, dv, None, None
 

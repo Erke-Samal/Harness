@@ -42,6 +42,7 @@ _ARGS_ATTR = "_skyxplorers_launch_args"
 # Cache for per-device NF4 / FP4 float32 codebooks and temporary dequant buffer.
 _CODEBOOK_CACHE: dict[tuple[torch.device, str], torch.Tensor] = {}
 _DEQUANT_SCRATCH: dict[torch.device, torch.Tensor] = {}
+_SCRATCH_VIEWS: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
 
 
 def _get_codebook(quant_type: str, device: torch.device, fallback_code: Optional[torch.Tensor]) -> torch.Tensor:
@@ -61,6 +62,9 @@ def _get_codebook(quant_type: str, device: torch.device, fallback_code: Optional
 
 
 def _get_dequant_scratch(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    view = _SCRATCH_VIEWS.get((device, shape))
+    if view is not None:
+        return view
     n_elems = math.prod(shape)
     buf = _DEQUANT_SCRATCH.get(device)
     if buf is None or buf.numel() < n_elems:
@@ -68,7 +72,10 @@ def _get_dequant_scratch(shape: tuple[int, ...], device: torch.device) -> torch.
         alloc_elems = max(n_elems, 8960 * 1536)
         buf = torch.empty(alloc_elems, dtype=torch.float16, device=device)
         _DEQUANT_SCRATCH[device] = buf
-    return buf[:n_elems].view(shape)
+        _SCRATCH_VIEWS.clear()
+    view = buf[:n_elems].view(shape)
+    _SCRATCH_VIEWS[(device, shape)] = view
+    return view
 
 
 @triton.jit(do_not_specialize=["n_bytes"])
