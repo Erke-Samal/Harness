@@ -27,7 +27,7 @@ _BLOCK = 64
 _MAX_FP16_GRAD = 16.0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len"])
 def triton_causal_softmax_kernel(
     P_ptr,
     seq_len,
@@ -57,7 +57,7 @@ def triton_causal_softmax_kernel(
         tl.store(row_ptr + cols, prob.to(P_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len"])
 def triton_causal_softmax_vjp_kernel(
     P_ptr,
     G_ptr,

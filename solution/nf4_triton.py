@@ -68,7 +68,7 @@ def _get_dequant_scratch(shape: tuple[int, ...], device: torch.device) -> torch.
     return buf[:n_elems].view(shape)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_bytes"])
 def triton_nf4_dequant_kernel(
     qweight_ptr,
     absmax_ptr,

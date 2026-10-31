@@ -45,6 +45,11 @@ Other patches, in `solution/__init__.py`:
   never attend to later padding, `position_ids` do not depend on the mask, and TRL still reads the
   mask from `inputs` for its metrics.
 
+- `solution/precompile.py` launches each kernel once on tiny tensors in a thread of the same
+  process, while Soup loads the model, so the first steps do not stop to compile. Nothing is cached
+  between runs, and this time is inside the measured `soup train`.
+- Kernels do not specialize on `seq_len`, so a new batch length does not trigger a recompilation.
+
 **How the chunked loss plugs in.** We do not turn on Soup's optional `stream_loss_chunk` mode: the
 config is untouched. Our own patch of `Qwen2ForCausalLM.forward` holds back `lm_head` on a labelled
 training step, and our patch of `trl.SFTTrainer.compute_loss` logs `entropy`, `num_tokens` and

@@ -28,6 +28,7 @@ import torch
 from solution.attention_triton import patch_qwen2_attention
 from solution.cross_entropy_triton import arm_chunked_ce, patch_chunked_ce_loss
 from solution.nf4_triton import patch_nf4_and_lora
+from solution.precompile import start_compiling
 from solution.rmsnorm_triton import patch_qwen2_rmsnorm
 from solution.rope_triton import patch_qwen2_rope
 from solution.swiglu import patch_qwen2_mlp
@@ -138,5 +139,6 @@ def apply() -> None:
     patch_chunked_ce_loss()
     _patch_qwen2_causal_attention_mask()
     _patch_soup_sft_setup()
+    start_compiling()
 
     _APPLIED = True

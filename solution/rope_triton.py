@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len"])
 def triton_rope_qk_fwd_kernel(
     Q_ptr,
     K_ptr,
@@ -82,7 +82,7 @@ def triton_rope_qk_fwd_kernel(
         tl.store(out_base + HALF_D + offs, y2.to(KO_ptr.dtype.element_ty))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len"])
 def triton_rope_qk_bwd_kernel(
     DQO_ptr,
     DKO_ptr,
