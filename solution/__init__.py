@@ -22,6 +22,7 @@ supporting QLoRA / Soup SFT wiring:
 from __future__ import annotations
 
 import gc
+import importlib.metadata
 
 import torch
 
@@ -131,6 +132,20 @@ def _patch_soup_sft_setup() -> None:
     soup_sft.SFTTrainerWrapper._setup_transformers = _wrapped_setup_transformers
 
 
+def _skip_repeated_startup_work() -> None:
+    """Two costs of ``soup train`` that buy nothing for a run in memory.
+
+    ``trl`` scans the files of every installed package at import, as ``transformers`` has already
+    done in this process, so it gets that same mapping. ``datasets`` hashes the mapped function and
+    its tokenizer to name a cache file that a dataset held in memory never uses.
+    """
+    import datasets
+    from transformers.utils import import_utils
+
+    importlib.metadata.packages_distributions = lambda: import_utils.PACKAGE_DISTRIBUTION_MAPPING
+    datasets.disable_caching()
+
+
 def apply() -> None:
     """Install all custom Triton kernel patches for ``soup train``."""
     global _APPLIED
@@ -138,6 +153,8 @@ def apply() -> None:
         return
 
     gc.disable()  # the imports below create objects that live until the process exits
+    scan_packages = importlib.metadata.packages_distributions
+    _skip_repeated_startup_work()
     patch_qwen2_mlp()
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
@@ -147,6 +164,7 @@ def apply() -> None:
     _patch_qwen2_causal_attention_mask()
     _patch_soup_sft_setup()
     start_compiling()
+    importlib.metadata.packages_distributions = scan_packages
     gc.enable()
 
     _APPLIED = True
