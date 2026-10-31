@@ -22,6 +22,10 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
    kernel launches, in forward and again in backward.
 4. **The 4D padding mask.** A right-padded 2D mask becomes a 4D mask, which turns off native GQA
    and `is_causal` in SDPA.
+5. **Padding.** On the public rows 0-255, about 43% of the positions of a random batch of 4 are
+   pad tokens. A real token never reads a later pad in causal attention, so they do no useful work.
+6. **Attention in fp32.** On a T4 SDPA upcasts fp16 inputs to fp32, repeats K and V for each query
+   head, and autograd keeps the attention weights of all 28 layers until backward.
 
 | Module | Kernels | What it does |
 |---|---|---|
@@ -29,6 +33,8 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
 | `solution/cross_entropy_triton.py` | `triton_vocab_ce_entropy_bwd_kernel` | Chunks of 64 positions in one reused workspace. One row pass gives cross-entropy, Shannon entropy and argmax by an online softmax; a second pass overwrites the chunk with `softmax - one_hot`. Full logits are never built on a training step. |
 | `solution/rmsnorm_triton.py` | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | RMSNorm in fp32 registers with output in the input's dtype, which stops the fp32 cascade. Saves `x` and a 1D `rstd`. |
 | `solution/rope_triton.py` | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | Q and K rotary embedding in one launch, reading the non-contiguous views directly. Backward saves only `cos` and `sin`. |
+| `solution/attention_triton.py` | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | Causal GQA attention in fp16 instead of PyTorch's fp32 math path. Query heads that share a key head form one matrix, so K and V are never repeated. Autograd saves Q, K and V only: the `[B, H, S, S]` weights are rebuilt in backward, one layer at a time. |
+| `solution/token_packing.py` | `triton_token_copy_kernel` | Pad-free steps: norms and linear layers see `[1, N, W]` real tokens, and only attention copies them to a `[B, S, W]` grid. Rows stay in their own batch and order. |
 | `solution/swiglu.py` | `triton_swiglu_2d_fwd_kernel`, `triton_swiglu_2d_bwd_kernel` | SwiGLU over 2D rows, `silu(gate)` recomputed in backward. **This is our rewrite of the kit's example, so we do not claim it as our own kernel**: the rules say the example does not count however it is rewritten. |
 
 Other patches, in `solution/__init__.py`:
@@ -49,6 +55,9 @@ Soup's rewind recorder already reads for steps without logits.
 softmax* (2018); the chunked loss idea and its data layout come from Soup's own
 `soup_cli/utils/stream_loss_chunk.py`; the NF4 format comes from Dettmers et al., *QLoRA* (2023) and
 the `bitsandbytes` `QuantState`. The fused-kernel path follows the kit's `solution/swiglu.py`.
+Removing pads inside a batch comes from the hints of the task statement. Rebuilding values in
+backward instead of storing them follows the recomputation idea of Chen et al., *Training Deep Nets
+with Sublinear Memory Cost* (2016), https://arxiv.org/abs/1604.06174. All kernel code is our own.
 
 ## 2. How to run it
 
@@ -99,5 +108,9 @@ Limits:
    registers.
 5. The fast LoRA path covers one vanilla adapter; DoRA, several adapters and merged layers use
    peft's original forward. Unusual masks (left padding, gaps) keep the 2D mask.
-6. LoRA dropout keeps its probability but draws its mask by our own code, so masks differ from the
+6. Attention still runs on the `[B, S]` grid, so its cost follows the longest row of a batch.
+   Backward computes the weights a second time, which costs time to save memory.
+7. Attention sums in fp16 are less exact than the base's fp32. Backward redoes a layer in fp32 when
+   an overflow appears, and checks 6 and 7 compare the outputs with the base.
+8. LoRA dropout keeps its probability but draws its mask by our own code, so masks differ from the
    base run.

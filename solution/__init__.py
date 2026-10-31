@@ -1,6 +1,6 @@
 """Entry point for the custom Triton solution package (team ``skyxplorers``).
 
-``solution.apply()`` installs six custom ``@triton.jit`` kernel modules and the
+``solution.apply()`` installs seven custom ``@triton.jit`` kernel modules and the
 supporting QLoRA / Soup SFT wiring:
   1. ``solution.nf4_triton``: Fused single-launch NF4/FP4 double-dequantization
      (``triton_nf4_dequant_kernel``) + fused QLoRA autograd functions.
@@ -17,6 +17,7 @@ supporting QLoRA / Soup SFT wiring:
      ``triton_swiglu_2d_bwd_kernel``).
   6. ``solution.attention_triton``: fp16 causal GQA attention with weights rebuilt in
      backward (``triton_causal_softmax_kernel``, ``triton_causal_softmax_vjp_kernel``).
+  7. ``solution.token_packing``: pad-free training steps (``triton_token_copy_kernel``).
 """
 
 from __future__ import annotations

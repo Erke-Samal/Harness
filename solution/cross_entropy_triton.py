@@ -7,9 +7,9 @@ materializing the full ``[B=4, S=512, V=151936]`` logits tensor 3+ times per ste
 ``outputs.logits[..., :-1, :].contiguous()``), which consumes over 3,100 MiB of peak
 GPU memory and performs ~10 full-vocabulary HBM passes per step.
 
-Our ``@triton.jit`` kernel ``triton_vocab_ce_entropy_bwd_kernel`` processes sequence
-chunks of size ``chunk=64`` (reusing a single 74 MiB workspace buffer across all
-chunks) and in a single fused vocabulary kernel computes:
+Our ``@triton.jit`` kernel ``triton_vocab_ce_entropy_bwd_kernel`` processes token rows
+in chunks of ``CE_CHUNK`` (reusing a single workspace buffer across all chunks), skips
+padding when the step is packed (``solution.token_packing``), and in a single fused vocabulary kernel computes:
   1. Exact per-token cross-entropy loss (for both scalar loss and ``rewind.jsonl``).
   2. Exact per-token Shannon entropy ``H(p) = log(Z) - sum_j exp(x_j - m) * (x_j - m) / Z``
      via a shift-invariant online softmax recurrence (for TRL ``entropy`` logging).
@@ -36,12 +36,14 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from solution.token_packing import TokenPacking, plan_token_packing
+
 # The attribute under which Soup's rewind recorder looks for per-token losses.
 _STEP_ATTR = "_soup_chunked_step"
 _ARMED_ATTR = "_skyxplorers_chunked_ce"
 _LAST_STEP_ATTR = "_skyxplorers_last_step"
 
-CE_CHUNK = 64
+CE_CHUNK = 128
 _LOGITS_WORKSPACE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
@@ -145,19 +147,17 @@ class _TritonChunkedHeadLossFunction(torch.autograd.Function):
         hidden: torch.Tensor,
         lm_head_weight: torch.Tensor,
         lm_head_bias: Optional[torch.Tensor],
-        labels: torch.Tensor,
+        targets: torch.Tensor,
         chunk_size: int,
         num_items_in_batch: Optional[int],
         ignore_index: int,
     ):
-        batch, seq_len, hidden_dim = hidden.shape
+        # hidden: [R, D], targets: [R]; each row predicts its own target.
+        n_total, hidden_dim = hidden.shape
         vocab_size = lm_head_weight.shape[0]
         device = hidden.device
 
-        # Causal LM shift: position t predicts label t + 1, the last position nothing.
-        shift_labels = F.pad(labels, (0, 1), value=ignore_index)[:, 1:]
-        valid_mask = shift_labels.ne(ignore_index)
-        valid_count = valid_mask.sum()
+        valid_count = targets.ne(ignore_index).sum()
 
         if num_items_in_batch is not None:
             if torch.is_tensor(num_items_in_batch):
@@ -181,9 +181,9 @@ class _TritonChunkedHeadLossFunction(torch.autograd.Function):
             else lm_head_bias
         )
 
-        token_losses = torch.empty((batch, seq_len), dtype=torch.float32, device=device)
-        token_entropies = torch.empty((batch, seq_len), dtype=torch.float32, device=device)
-        token_correct = torch.empty((batch, seq_len), dtype=torch.int32, device=device)
+        token_losses = torch.empty(n_total, dtype=torch.float32, device=device)
+        token_entropies = torch.empty(n_total, dtype=torch.float32, device=device)
+        token_correct = torch.empty(n_total, dtype=torch.int32, device=device)
 
         if need_h_grad:
             grad_hidden = torch.zeros_like(hidden, dtype=torch.float32)
@@ -200,36 +200,27 @@ class _TritonChunkedHeadLossFunction(torch.autograd.Function):
         else:
             grad_b_accum = torch.empty(0, dtype=torch.float32, device=device)
 
-        max_chunk_rows = batch * min(chunk_size, seq_len)
-        logits_ws = _get_logits_workspace(max_chunk_rows, vocab_size, compute_dtype, device)
+        logits_ws = _get_logits_workspace(min(chunk_size, n_total), vocab_size, compute_dtype, device)
 
         BLOCK_V = 4096
         num_warps = 8
 
-        for s_start in range(0, seq_len, chunk_size):
-            s_end = min(s_start + chunk_size, seq_len)
-            cur_s = s_end - s_start
-            n_rows = batch * cur_s
+        for start in range(0, n_total, chunk_size):
+            end = min(start + chunk_size, n_total)
+            n_rows = end - start
 
-            h_slice = hidden[:, s_start:s_end, :]
-            h_2d = h_slice.to(compute_dtype).reshape(n_rows, hidden_dim).contiguous()
-            t_flat = shift_labels[:, s_start:s_end].reshape(n_rows).contiguous()
-
+            h_2d = hidden[start:end].to(compute_dtype)
             logits_chunk = logits_ws[:n_rows]
             torch.mm(h_2d, w_comp.t(), out=logits_chunk)
             if b_comp is not None:
                 logits_chunk.add_(b_comp)
 
-            losses_flat = torch.empty(n_rows, dtype=torch.float32, device=device)
-            entropies_flat = torch.empty(n_rows, dtype=torch.float32, device=device)
-            correct_flat = torch.empty(n_rows, dtype=torch.int32, device=device)
-
             triton_vocab_ce_entropy_bwd_kernel[(n_rows,)](
                 logits_chunk,
-                t_flat,
-                losses_flat,
-                entropies_flat,
-                correct_flat,
+                targets[start:end],
+                token_losses[start:end],
+                token_entropies[start:end],
+                token_correct[start:end],
                 logits_chunk.stride(0),
                 vocab_size,
                 int(ignore_index),
@@ -238,15 +229,10 @@ class _TritonChunkedHeadLossFunction(torch.autograd.Function):
                 num_warps=num_warps,
             )
 
-            token_losses[:, s_start:s_end] = losses_flat.view(batch, cur_s)
-            token_entropies[:, s_start:s_end] = entropies_flat.view(batch, cur_s)
-            token_correct[:, s_start:s_end] = correct_flat.view(batch, cur_s)
-
             if with_grad:
                 # logits_chunk now holds unscaled dlogits in [-1, 1]
                 if need_h_grad:
-                    gh_2d = torch.mm(logits_chunk, w_comp)
-                    grad_hidden[:, s_start:s_end, :] = gh_2d.view(batch, cur_s, hidden_dim).to(torch.float32)
+                    grad_hidden[start:end] = torch.mm(logits_chunk, w_comp).to(torch.float32)
                 if need_w_grad:
                     gw_chunk = torch.mm(logits_chunk.t(), h_2d)
                     grad_w_accum.add_(gw_chunk.to(torch.float32))
@@ -302,17 +288,33 @@ def triton_chunked_causal_lm_loss(
     chunk_size: int = 64,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
+    packing: Optional[TokenPacking] = None,
 ):
-    """Run chunked causal LM loss + entropy + top-1 accuracy via Triton."""
-    return _TritonChunkedHeadLossFunction.apply(
-        hidden,
+    """Run chunked causal LM loss + entropy + top-1 accuracy via Triton.
+
+    ``hidden`` is ``[B, S, D]``, or ``[1, N, D]`` with a ``packing``. Token results are ``[B, S]``,
+    and position t of a row holds the loss of label t + 1, with 0 on padding.
+    """
+    batch, seq_len = labels.shape
+    # Causal LM shift: position t predicts label t + 1, the last position nothing.
+    targets = F.pad(labels, (0, 1), value=ignore_index)[:, 1:].reshape(-1)
+    if packing is not None:
+        targets = targets[packing.index]
+
+    loss, token_losses, token_entropies, correct, valid = _TritonChunkedHeadLossFunction.apply(
+        hidden.reshape(-1, hidden.shape[-1]),
         lm_head_weight,
         lm_head_bias,
-        labels,
+        targets,
         int(chunk_size),
         num_items_in_batch,
         int(ignore_index),
     )
+    if packing is not None:
+        index = packing.index
+        token_losses = token_losses.new_zeros(batch * seq_len).index_copy_(0, index, token_losses)
+        token_entropies = token_entropies.new_zeros(batch * seq_len).index_copy_(0, index, token_entropies)
+    return loss, token_losses.view(batch, seq_len), token_entropies.view(batch, seq_len), correct, valid
 
 
 @dataclass(frozen=True)
@@ -383,7 +385,23 @@ def patch_chunked_ce_loss() -> None:
         labels = kwargs.pop("labels")
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
         kwargs.pop("logits_to_keep", None)
-        outputs = self.model(**kwargs)
+
+        packing = None
+        if kwargs.get("past_key_values") is None and kwargs.get("position_ids") is None:
+            packing = plan_token_packing(self.model, kwargs.get("input_ids"), kwargs.get("attention_mask"))
+        if packing is None:
+            outputs = self.model(**kwargs)
+        else:
+            input_ids = kwargs.pop("input_ids")
+            device = input_ids.device
+            kwargs.update(
+                attention_mask=None,
+                use_cache=False,
+                inputs_embeds=self.model.embed_tokens(input_ids.view(-1)[packing.index].unsqueeze(0)),
+                position_ids=torch.arange(packing.seq_len, device=device).unsqueeze(0),
+                token_packing=packing,
+            )
+            outputs = self.model(**kwargs)
 
         lm_head = self.lm_head
         loss, token_losses, token_entropies, correct, valid = triton_chunked_causal_lm_loss(
@@ -393,6 +411,7 @@ def patch_chunked_ce_loss() -> None:
             lm_head_bias=lm_head.bias,
             chunk_size=CE_CHUNK,
             num_items_in_batch=num_items_in_batch,
+            packing=packing,
         )
         setattr(self, _LAST_STEP_ATTR, ChunkStep(token_entropies, token_losses, correct, valid))
         return CausalLMOutputWithPast(

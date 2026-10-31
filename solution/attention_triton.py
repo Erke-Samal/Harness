@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+from solution.token_packing import pack_tokens, unpack_tokens
+
 _BLOCK = 64
 _MAX_FP16_GRAD = 16.0
 
@@ -184,9 +186,24 @@ def patch_qwen2_attention() -> None:
 
     orig_forward = modeling_qwen2.Qwen2Attention.forward
 
+    def _packed_attention_forward(self, hidden_states, position_embeddings, packing):
+        grid_shape = (packing.batch, packing.seq_len, -1, self.head_dim)
+        q = unpack_tokens(self.q_proj(hidden_states), packing).view(grid_shape).transpose(1, 2)
+        k = unpack_tokens(self.k_proj(hidden_states), packing).view(grid_shape).transpose(1, 2)
+        v = unpack_tokens(self.v_proj(hidden_states), packing).view(grid_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        q, k = modeling_qwen2.apply_rotary_pos_emb(q, k, cos, sin)
+        out = triton_causal_gqa_attention(q, k, v, self.scaling)
+        return self.o_proj(pack_tokens(out, packing)), None
+
     def _fast_attention_forward(
-        self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs
+        self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
+        token_packing=None, **kwargs
     ):
+        if token_packing is not None:
+            return _packed_attention_forward(self, hidden_states, position_embeddings, token_packing)
+
         seq_len = hidden_states.shape[1]
         if (
             attention_mask is not None

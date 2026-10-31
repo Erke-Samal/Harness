@@ -16,6 +16,7 @@ from solution.nf4_triton import triton_dequantize_nf4
 from solution.rmsnorm_triton import triton_rmsnorm
 from solution.rope_triton import _pytorch_rope_fallback, triton_rope_qk
 from solution.swiglu import swiglu
+from solution.token_packing import TokenPacking, pack_tokens, unpack_tokens
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -230,3 +231,21 @@ def test_causal_gqa_attention_matches_sdpa(dtype: torch.dtype, seq_len: int) -> 
     torch.testing.assert_close(q.grad.float(), q_ref.grad, atol=atol, rtol=rtol)
     torch.testing.assert_close(k.grad.float(), k_ref.grad, atol=atol, rtol=rtol)
     torch.testing.assert_close(v.grad.float(), v_ref.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("width", [256, 1536, 4000])
+def test_token_packing_round_trip_and_gradients(width: int) -> None:
+    mask = torch.zeros((3, 9), dtype=torch.bool, device="cuda")
+    for row, length in enumerate((9, 4, 6)):
+        mask[row, :length] = True
+    packing = TokenPacking(mask.view(-1).nonzero().squeeze(1), 3, 9)
+    packed = torch.randn((1, packing.index.numel(), width), device="cuda", dtype=torch.float16).requires_grad_(True)
+
+    grid = unpack_tokens(packed, packing)
+    assert torch.equal(grid[mask], packed[0])
+    assert not grid[~mask].any()
+    assert torch.equal(pack_tokens(grid, packing), packed)
+
+    weight = torch.randn((3, 9, width), device="cuda", dtype=torch.float16)
+    (grid.float() * weight.float()).sum().backward()
+    assert torch.equal(packed.grad[0], weight[mask])
