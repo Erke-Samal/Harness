@@ -106,14 +106,14 @@ class _TritonSwiGLUFunction(torch.autograd.Function):
             gate_2d, up_2d, out_2d, a, b, a_scale, b_scale, n_cols, n_tiles, BLOCK=_BLOCK, num_warps=2
         )
 
-        ctx.compressed = (a, b, a_scale, b_scale)
+        ctx.save_for_backward(a, b, a_scale, b_scale)
         ctx.shape = gate.shape
         ctx.dtype = gate.dtype
         return out_2d.view(gate.shape)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a, b, a_scale, b_scale = ctx.compressed
+        a, b, a_scale, b_scale = ctx.saved_tensors
         n_rows, n_cols = a.shape
         n_tiles = a_scale.shape[1]
 
