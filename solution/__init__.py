@@ -28,7 +28,7 @@ import torch
 
 from solution.attention_triton import patch_qwen2_attention
 from solution.cross_entropy_triton import arm_chunked_ce, patch_chunked_ce_loss
-from solution.nf4_triton import patch_nf4_and_lora
+from solution.nf4_triton import offload_packed_weights, patch_nf4_and_lora
 from solution.precompile import start_compiling
 from solution.rmsnorm_triton import patch_qwen2_rmsnorm
 from solution.rope_triton import patch_qwen2_rope
@@ -115,6 +115,8 @@ def _patch_soup_sft_setup() -> None:
         causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
         if isinstance(causal_lm, modeling_qwen2.Qwen2ForCausalLM):
             arm_chunked_ce(causal_lm)
+
+        offload_packed_weights(model)
 
         if cast_any:
             gc.collect()

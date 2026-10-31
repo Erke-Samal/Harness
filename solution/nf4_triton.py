@@ -40,11 +40,13 @@ _SHIFT_MAP = {
 
 _BLOCK_BYTES = 512
 _ARGS_ATTR = "_skyxplorers_launch_args"
+_HOST_ATTR = "_skyxplorers_host_weight"
 
 # Cache for per-device NF4 / FP4 float32 codebooks and temporary dequant buffer.
 _CODEBOOK_CACHE: dict[tuple[torch.device, str], torch.Tensor] = {}
 _DEQUANT_SCRATCH: dict[torch.device, torch.Tensor] = {}
 _SCRATCH_VIEWS: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
+_PACKED_SCRATCH: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_codebook(quant_type: str, device: torch.device, fallback_code: Optional[torch.Tensor]) -> torch.Tensor:
@@ -78,6 +80,36 @@ def _get_dequant_scratch(shape: tuple[int, ...], device: torch.device) -> torch.
     view = buf[:n_elems].view(shape)
     _SCRATCH_VIEWS[(device, shape)] = view
     return view
+
+
+def _weight_device(quant_state: Any) -> torch.device:
+    """Where the weight is unpacked: its state stays on the GPU when the packed bytes move to the host."""
+    return quant_state.absmax.device
+
+
+def _fetch_packed(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy a packed weight from pinned host memory to the one GPU buffer that all weights share."""
+    n_bytes = host.numel()
+    buf = _PACKED_SCRATCH.get(device)
+    if buf is None or buf.numel() < n_bytes:
+        buf = torch.empty(max(n_bytes, 8960 * 1536 // 2), dtype=host.dtype, device=device)
+        _PACKED_SCRATCH[device] = buf
+    packed = buf[:n_bytes].view(host.shape)
+    packed.copy_(host, non_blocking=True)
+    return packed
+
+
+def offload_packed_weights(model: torch.nn.Module) -> None:
+    """Keep the packed bytes of every 4-bit weight in pinned host memory; values do not change."""
+    import bitsandbytes as bnb
+
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if not isinstance(module, bnb.nn.Linear4bit) or getattr(weight, "quant_state", None) is None:
+            continue
+        host = weight.data.to("cpu").pin_memory()
+        setattr(weight.quant_state, _HOST_ATTR, host)
+        weight.data = host
 
 
 @triton.jit(do_not_specialize=["n_bytes"])
@@ -189,6 +221,10 @@ def triton_dequantize_nf4(
     if quant_state is None:
         return _orig_dequantize_4bit(A, None, absmax, out, blocksize, quant_type)
 
+    host = getattr(quant_state, _HOST_ATTR, None)
+    if host is not None:
+        A = _fetch_packed(host, _weight_device(quant_state))
+
     launch = _launch_args(A, quant_state)
     if launch is None:
         return _orig_dequantize_4bit(A, quant_state, absmax, out, blocksize, quant_type)
@@ -267,7 +303,7 @@ class _TritonBNBLinearFunction(torch.autograd.Function):
         x_fp16 = x.to(compute_dtype) if x.dtype != compute_dtype else x
         x_2d = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
 
-        w_scratch = _get_dequant_scratch(tuple(quant_state.shape), qweight.device)
+        w_scratch = _get_dequant_scratch(tuple(quant_state.shape), _weight_device(quant_state))
         w_deq = triton_dequantize_nf4(qweight, quant_state, out=w_scratch)
         out_2d = torch.mm(x_2d, w_deq.t())
 
@@ -297,7 +333,7 @@ class _TritonBNBLinearFunction(torch.autograd.Function):
 
         grad_x = None
         if ctx.needs_input_grad[0]:
-            w_scratch = _get_dequant_scratch(tuple(quant_state.shape), qweight.device)
+            w_scratch = _get_dequant_scratch(tuple(quant_state.shape), _weight_device(quant_state))
             w_deq = triton_dequantize_nf4(qweight, quant_state, out=w_scratch)
             grad_x_2d = torch.mm(grad_2d, w_deq)
             grad_x = grad_x_2d.view(*grad_output.shape[:-1], grad_x_2d.shape[-1])
@@ -332,7 +368,7 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
         x_2d = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
 
         # 1. Base 4-bit projection
-        w_scratch = _get_dequant_scratch(tuple(quant_state.shape), qweight.device)
+        w_scratch = _get_dequant_scratch(tuple(quant_state.shape), _weight_device(quant_state))
         w_deq = triton_dequantize_nf4(qweight, quant_state, out=w_scratch)
         out_2d = torch.mm(x_2d, w_deq.t())
         if bias is not None:
@@ -406,7 +442,7 @@ class _TritonQLoRALinearFunction(torch.autograd.Function):
         # grad_x = grad_2d @ W_deq + (grad_h_a @ lora_A) * drop_factor
         grad_x = None
         if ctx.needs_input_grad[0]:
-            w_scratch = _get_dequant_scratch(tuple(quant_state.shape), qweight.device)
+            w_scratch = _get_dequant_scratch(tuple(quant_state.shape), _weight_device(quant_state))
             w_deq = triton_dequantize_nf4(qweight, quant_state, out=w_scratch)
             grad_x_2d = torch.mm(grad_2d, w_deq)
             grad_x_lora = torch.mm(grad_h_a, lora_A_fp16)
