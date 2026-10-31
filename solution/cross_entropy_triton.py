@@ -37,7 +37,6 @@ import triton
 import triton.language as tl
 
 from solution.host_saved import saved_on_host
-from solution.nf4_triton import drop_gpu_copies
 from solution.token_packing import TokenPacking, plan_token_packing, set_active_packing
 
 # The attribute under which Soup's rewind recorder looks for per-token losses.
@@ -388,7 +387,6 @@ def patch_chunked_ce_loss() -> None:
         if not getattr(self, _FIRST_STEP_DONE_ATTR, False):
             setattr(self, _FIRST_STEP_DONE_ATTR, True)
             before = torch.cuda.memory_allocated()
-            drop_gpu_copies(self)
             torch.cuda.empty_cache()
             print("DIAG", before >> 20, torch.cuda.memory_allocated() >> 20, torch.cuda.memory_reserved() >> 20, torch.cuda.max_memory_allocated() >> 20, flush=True)
             torch.cuda.reset_peak_memory_stats()

@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 import torch
 
-from solution.nf4_triton import offload_packed_weight, restore_packed_weight
+from solution.nf4_triton import _HOST_ATTR, build_weight_stream, move_packed_weight_to_host, restore_packed_weight
 
 _EMBEDDING = "embed_tokens.weight"
 _loading = False
@@ -37,6 +37,7 @@ def patch_model_loading() -> None:
     if _PATCHED:
         return
 
+    import bitsandbytes as bnb
     from transformers import core_model_loading, modeling_utils
 
     orig_get_device = core_model_loading.get_device
@@ -54,12 +55,21 @@ def patch_model_loading() -> None:
             module_path, _, param_name = target_name.rpartition(".")
             weight = getattr(model.get_submodule(module_path), param_name, None)
             if getattr(weight, "quant_state", None) is not None:
-                offload_packed_weight(weight)
+                move_packed_weight_to_host(weight)
 
     def _warmup(*args: Any, **kwargs: Any) -> None:
         if not _loading:
             orig_warmup(*args, **kwargs)
 
+    orig_param_to = bnb.nn.Params4bit.to
+
+    def _param_to(self: Any, *args: Any, **kwargs: Any) -> Any:
+        """Preparing the model moves it to the GPU; the host copy is already the only one."""
+        if getattr(getattr(self, "quant_state", None), _HOST_ATTR, None) is not None:
+            return self
+        return orig_param_to(self, *args, **kwargs)
+
+    bnb.nn.Params4bit.to = _param_to
     core_model_loading.get_device = _get_device
     core_model_loading.set_param_for_module = _set_param
     modeling_utils.caching_allocator_warmup = _warmup
@@ -73,7 +83,9 @@ def place_loaded_model(model: torch.nn.Module, device: torch.device, fits_kernel
     """
     for param in model.parameters():
         if getattr(param, "quant_state", None) is not None:
-            if not fits_kernels:
+            if not fits_kernels and not param.is_cuda:
                 restore_packed_weight(param)
         elif not param.is_cuda:
             param.data = param.data.to(device)
+    if fits_kernels:
+        build_weight_stream(model, device)

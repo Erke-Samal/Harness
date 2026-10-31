@@ -19,6 +19,7 @@ and redraw peft's LoRA dropout mask in backward instead of storing it.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Optional
 
 import torch
@@ -46,7 +47,6 @@ _HOST_ATTR = "_skyxplorers_host_weight"
 _CODEBOOK_CACHE: dict[tuple[torch.device, str], torch.Tensor] = {}
 _DEQUANT_SCRATCH: dict[torch.device, torch.Tensor] = {}
 _SCRATCH_VIEWS: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
-_PACKED_SCRATCH: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_codebook(quant_type: str, device: torch.device, fallback_code: Optional[torch.Tensor]) -> torch.Tensor:
@@ -87,32 +87,95 @@ def _weight_device(quant_state: Any) -> torch.device:
     return quant_state.absmax.device
 
 
-def _fetch_packed(host: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Copy a packed weight from pinned host memory to the one GPU buffer that all weights share."""
-    n_bytes = host.numel()
-    buf = _PACKED_SCRATCH.get(device)
-    if buf is None or buf.numel() < n_bytes:
-        buf = torch.empty(max(n_bytes, 8960 * 1536 // 2), dtype=host.dtype, device=device)
-        _PACKED_SCRATCH[device] = buf
-    packed = buf[:n_bytes].view(host.shape)
-    packed.copy_(host, non_blocking=True)
-    return packed
+class WeightStream:
+    """The packed bytes of the decoder layers, one pinned slab on the host and two slots on the GPU.
+
+    The layer in use holds one slot; the next one, in the direction of travel, arrives in the other
+    on its own CUDA stream while the kernels run. A copy starts only after the kernels queued so far
+    have finished, and the kernels of a layer start only after its copy has. The scheme of keeping
+    parameters on the host and prefetching the next block on a separate stream is from MegaTrain
+    (arXiv:2604.05091) and SuperNeurons (arXiv:1801.04380).
+    """
+
+    def __init__(self, slab: torch.Tensor, spans: list[tuple[int, int]], device: torch.device) -> None:
+        self.slab = slab
+        self.spans = spans
+        slot_bytes = max(end - start for start, end in spans)
+        self.slots = [torch.empty(slot_bytes, dtype=torch.uint8, device=device) for _ in range(2)]
+        self.owner: list[Optional[int]] = [None, None]
+        self.ready: list[Any] = [None, None]
+        self.stream = torch.cuda.Stream(device)
+        self.layer: Optional[int] = None
+        self.slot = 0
+
+    def _copy(self, layer: int, slot: int) -> None:
+        queued = torch.cuda.Event()
+        queued.record(torch.cuda.current_stream())
+        start, end = self.spans[layer]
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(queued)
+            self.slots[slot][: end - start].copy_(self.slab[start:end], non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self.stream)
+        self.owner[slot] = layer
+        self.ready[slot] = ready
+
+    def _enter(self, layer: int) -> None:
+        going_up = self.layer is None or layer > self.layer
+        if layer in self.owner:
+            self.slot = self.owner.index(layer)
+        else:
+            self.slot = 0 if self.layer is None else 1 - self.slot
+            self._copy(layer, self.slot)
+        torch.cuda.current_stream().wait_event(self.ready[self.slot])
+        self.layer = layer
+        following = layer + 1 if going_up else layer - 1
+        if 0 <= following < len(self.spans) and self.owner[1 - self.slot] != following:
+            self._copy(following, 1 - self.slot)
+
+    def packed(self, layer: int, offset: int, shape: tuple[int, ...]) -> torch.Tensor:
+        if layer != self.layer:
+            self._enter(layer)
+        return self.slots[self.slot][offset : offset + math.prod(shape)].view(shape)
 
 
-def offload_packed_weight(weight: torch.Tensor) -> None:
-    """Keep the packed bytes of a 4-bit weight in pinned host memory; its values do not change."""
-    host = weight.data.to("cpu").pin_memory()
-    setattr(weight.quant_state, _HOST_ATTR, host)
-    weight.data = host
+def move_packed_weight_to_host(weight: torch.Tensor) -> None:
+    """Right after quantization, before the slab can be sized."""
+    weight.data = weight.data.to("cpu")
+    setattr(weight.quant_state, _HOST_ATTR, True)
 
 
-def drop_gpu_copies(model: torch.nn.Module) -> None:
-    """Moving the model while the trainer prepares it brings packed weights back: only the host copy stays."""
-    for param in model.parameters():
-        state = getattr(param, "quant_state", None)
-        host = getattr(state, _HOST_ATTR, None)
-        if host is not None and param.is_cuda:
-            param.data = host
+def build_weight_stream(model: torch.nn.Module, device: torch.device) -> None:
+    """Gather the packed weights of the decoder layers into one pinned slab; values do not change."""
+    layers: dict[int, list[torch.Tensor]] = {}
+    for name, param in model.named_parameters():
+        if getattr(getattr(param, "quant_state", None), _HOST_ATTR, None) is None:
+            continue
+        match = re.search(r"\.layers\.(\d+)\.", name)
+        if match is None:
+            param.data = param.data.to(device)
+            setattr(param.quant_state, _HOST_ATTR, None)
+            continue
+        layers.setdefault(int(match.group(1)), []).append(param)
+
+    total = sum(p.data.nbytes for params in layers.values() for p in params)
+    slab = torch.empty(total, dtype=torch.uint8).pin_memory()
+    spans = []
+    used = 0
+    places = []
+    for number, layer in enumerate(sorted(layers)):
+        start = used
+        for param in layers[layer]:
+            n_bytes = param.data.nbytes
+            slab[used : used + n_bytes].copy_(param.data.view(-1).view(torch.uint8))
+            places.append((param, number, used - start, used, n_bytes))
+            used += n_bytes
+        spans.append((start, used))
+    stream = WeightStream(slab, spans, device)
+    for param, number, offset, start, n_bytes in places:
+        shape = tuple(param.data.shape)
+        param.data = slab[start : start + n_bytes].view(param.data.dtype).view(shape)
+        setattr(param.quant_state, _HOST_ATTR, (stream, number, offset, shape))
 
 
 def restore_packed_weight(weight: torch.Tensor) -> None:
@@ -177,8 +240,12 @@ def _launch_args(A: torch.Tensor, quant_state: Any) -> Optional[tuple]:
     once. Above all this reads ``offset`` from the GPU once: ``.item()`` waits for the whole queue.
     """
     cached = getattr(quant_state, _ARGS_ATTR, None)
-    if cached is not None and cached[0] == A.data_ptr():
-        return cached
+    if cached is None:
+        cached = {}
+        setattr(quant_state, _ARGS_ATTR, cached)
+    known = cached.get(A.data_ptr())
+    if known is not None:
+        return known
 
     b1 = int(quant_state.blocksize)
     nested = bool(quant_state.nested)
@@ -210,7 +277,7 @@ def _launch_args(A: torch.Tensor, quant_state: Any) -> Optional[tuple]:
     }
     grid = (triton.cdiv(n_bytes, _BLOCK_BYTES),)
     args = (A.data_ptr(), grid, qweight, absmax, qabsmax, state2_absmax, state2_code, nf4_code, offset, n_bytes, constants)
-    setattr(quant_state, _ARGS_ATTR, args)
+    cached[A.data_ptr()] = args
     return args
 
 
@@ -231,7 +298,8 @@ def triton_dequantize_nf4(
 
     host = getattr(quant_state, _HOST_ATTR, None)
     if host is not None:
-        A = _fetch_packed(host, _weight_device(quant_state))
+        stream, layer, offset, shape = host
+        A = stream.packed(layer, offset, shape)
 
     launch = _launch_args(A, quant_state)
     if launch is None:
