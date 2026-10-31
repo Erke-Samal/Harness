@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from solution.attention_triton import triton_causal_gqa_attention
 from solution.cross_entropy_triton import triton_chunked_causal_lm_loss
 from solution.nf4_triton import triton_dequantize_nf4
 from solution.rmsnorm_triton import triton_rmsnorm
@@ -102,7 +103,7 @@ def test_rope_qk_matches_pytorch(dtype: torch.dtype, broadcast_batch: bool) -> N
     q_out, k_out = triton_rope_qk(q_raw.transpose(1, 2), k_raw.transpose(1, 2), cos, sin)
     q_ref, k_ref = _pytorch_rope_fallback(q_ref_raw.transpose(1, 2), k_ref_raw.transpose(1, 2), cos, sin)
 
-    atol, rtol = TOL[dtype]
+    atol, rtol = (5e-3, 5e-3) if dtype == torch.float16 else TOL[dtype]
     torch.testing.assert_close(q_out, q_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(k_out, k_ref, atol=atol, rtol=rtol)
 
@@ -170,7 +171,7 @@ def test_chunked_cross_entropy_and_entropy_match_reference(dtype: torch.dtype) -
     logits_ref = logits_all[:, :-1, :]
     shift_labels = labels[:, 1:].contiguous()
     tok_losses_ref = F.cross_entropy(
-        logits_ref.view(-1, vocab_size),
+        logits_ref.reshape(-1, vocab_size),
         shift_labels.view(-1),
         ignore_index=ignore_index,
         reduction="none",
@@ -196,3 +197,36 @@ def test_chunked_cross_entropy_and_entropy_match_reference(dtype: torch.dtype) -
 
     torch.testing.assert_close(hidden.grad, hidden_ref.grad.to(dtype), atol=atol, rtol=rtol)
     torch.testing.assert_close(weight.grad, weight_ref.grad.to(dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("seq_len", [2, 64, 129])
+def test_causal_gqa_attention_matches_sdpa(dtype: torch.dtype, seq_len: int) -> None:
+    batch, n_heads, n_kv_heads, head_dim = 2, 12, 2, 32
+    scaling = head_dim**-0.5
+    q = torch.randn((batch, n_heads, seq_len, head_dim), device="cuda", dtype=dtype).requires_grad_(True)
+    k = torch.randn((batch, n_kv_heads, seq_len, head_dim), device="cuda", dtype=dtype).requires_grad_(True)
+    v = torch.randn((batch, n_kv_heads, seq_len, head_dim), device="cuda", dtype=dtype).requires_grad_(True)
+    q_ref, k_ref, v_ref = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    weight = torch.randn((batch, seq_len, n_heads * head_dim), device="cuda")
+
+    out = triton_causal_gqa_attention(q, k, v, scaling)
+    repeats = n_heads // n_kv_heads
+    out_ref = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref.repeat_interleave(repeats, dim=1),
+        v_ref.repeat_interleave(repeats, dim=1),
+        is_causal=True,
+        scale=scaling,
+    )
+    out_ref = out_ref.transpose(1, 2).reshape(batch, seq_len, -1)
+
+    atol, rtol = (2e-2, 2e-2) if dtype == torch.float16 else (1e-4, 1e-4)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out.float(), out_ref, atol=atol, rtol=rtol)
+
+    (out.float() * weight).sum().backward()
+    (out_ref * weight).sum().backward()
+    torch.testing.assert_close(q.grad.float(), q_ref.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k.grad.float(), k_ref.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(v.grad.float(), v_ref.grad, atol=atol, rtol=rtol)

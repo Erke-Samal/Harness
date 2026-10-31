@@ -1,6 +1,6 @@
 """Entry point for the custom Triton solution package (team ``skyxplorers``).
 
-``solution.apply()`` installs five custom ``@triton.jit`` kernel modules and the
+``solution.apply()`` installs six custom ``@triton.jit`` kernel modules and the
 supporting QLoRA / Soup SFT wiring:
   1. ``solution.nf4_triton``: Fused single-launch NF4/FP4 double-dequantization
      (``triton_nf4_dequant_kernel``) + fused QLoRA autograd functions.
@@ -15,6 +15,8 @@ supporting QLoRA / Soup SFT wiring:
   5. ``solution.swiglu``: 2D multi-row tiled SwiGLU forward/backward with backward
      activation recomputation (``triton_swiglu_2d_fwd_kernel``,
      ``triton_swiglu_2d_bwd_kernel``).
+  6. ``solution.attention_triton``: fp16 causal GQA attention with weights rebuilt in
+     backward (``triton_causal_softmax_kernel``, ``triton_causal_softmax_vjp_kernel``).
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import gc
 
 import torch
 
+from solution.attention_triton import patch_qwen2_attention
 from solution.cross_entropy_triton import arm_chunked_ce, patch_chunked_ce_loss
 from solution.nf4_triton import patch_nf4_and_lora
 from solution.rmsnorm_triton import patch_qwen2_rmsnorm
@@ -130,6 +133,7 @@ def apply() -> None:
     patch_qwen2_mlp()
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
+    patch_qwen2_attention()
     patch_nf4_and_lora()
     patch_chunked_ce_loss()
     _patch_qwen2_causal_attention_mask()
