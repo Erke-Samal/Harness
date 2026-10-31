@@ -13,7 +13,7 @@ import threading
 import torch
 
 from solution.attention_triton import triton_causal_gqa_attention
-from solution.cross_entropy_triton import triton_chunked_causal_lm_loss
+from solution.cross_entropy_triton import CE_CHUNK, triton_chunked_causal_lm_loss
 from solution.nf4_triton import triton_nf4_dequant_kernel
 from solution.rmsnorm_triton import triton_rmsnorm
 from solution.rope_triton import triton_rope_qk
@@ -35,7 +35,7 @@ def compile_kernels(device: torch.device) -> None:
     packing = TokenPacking(torch.arange(seq_len, device=device), 1, seq_len)
 
     x = _tensor((1, seq_len, _HIDDEN), device)
-    weight = _tensor((_HIDDEN,), device, grad=False)
+    weight = torch.ones(_HIDDEN, dtype=torch.float32, device=device)  # norms stay in fp32
     pack_tokens(unpack_tokens(triton_rmsnorm(x, weight), packing), packing).sum().backward()
 
     gate, up = _tensor((1, seq_len, _MLP_WIDTH), device), _tensor((1, seq_len, _MLP_WIDTH), device)
@@ -51,7 +51,7 @@ def compile_kernels(device: torch.device) -> None:
     hidden = _tensor((1, seq_len, 16), device)
     head = _tensor((16, 16), device, grad=False)
     labels = torch.zeros((1, seq_len), dtype=torch.int64, device=device)
-    triton_chunked_causal_lm_loss(hidden, head, labels, chunk_size=128)[0].backward()
+    triton_chunked_causal_lm_loss(hidden, head, labels, chunk_size=CE_CHUNK)[0].backward()
 
     qweight = torch.zeros(4, dtype=torch.uint8, device=device)
     float_table = torch.zeros(16, dtype=torch.float32, device=device)

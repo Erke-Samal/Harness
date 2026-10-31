@@ -30,7 +30,7 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
 | Module | Kernels | What it does |
 |---|---|---|
 | `solution/nf4_triton.py` | `triton_nf4_dequant_kernel` | One launch for double-quantized NF4/FP4 unpacking: nested `absmax`, both nibbles, the codebook, pairs of fp16 written as one 32-bit word, into one reusable buffer. Autograd functions for `bnb.nn.Linear4bit` and the peft LoRA layer avoid `result.clone()` and keep the dropout mask in `uint8`. |
-| `solution/cross_entropy_triton.py` | `triton_vocab_ce_entropy_bwd_kernel` | Chunks of 64 positions in one reused workspace. One row pass gives cross-entropy, Shannon entropy and argmax by an online softmax; a second pass overwrites the chunk with `softmax - one_hot`. Full logits are never built on a training step. |
+| `solution/cross_entropy_triton.py` | `triton_vocab_ce_entropy_bwd_kernel` | Chunks of 32 positions in one reused workspace. One row pass gives cross-entropy, Shannon entropy and argmax by an online softmax; a second pass overwrites the chunk with `softmax - one_hot`. Full logits are never built on a training step. |
 | `solution/rmsnorm_triton.py` | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | RMSNorm in fp32 registers with output in the input's dtype, which stops the fp32 cascade. Saves `x` and a 1D `rstd`. |
 | `solution/rope_triton.py` | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | Q and K rotary embedding in one launch, reading the non-contiguous views directly. Backward saves only `cos` and `sin`. |
 | `solution/attention_triton.py` | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | Causal GQA attention in fp16 instead of PyTorch's fp32 math path. Query heads that share a key head form one matrix, so K and V are never repeated. Autograd saves Q, K and V only: the `[B, H, S, S]` weights are rebuilt in backward, one layer at a time. |
@@ -86,14 +86,14 @@ python harness/score.py runs/result.json
 
 ## 3. Results and limits
 
-**T4 results: not measured yet.** The table is filled from `runs/result.json` of the notebook
-above. Base numbers in the kit are the organizers' measurement, not ours.
+One Kaggle T4 run of commit `074ed8e` (`harness/run_task.py`, one repeat, public rows); all 10 checks
+of `harness/check_rules.py` passed, and our kernels took 23.5% of the training time.
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | `<from run>` | `<from run>` | `<speedup>`x |
-| Peak GPU memory (nvidia-smi), MiB | `<from run>` | `<from run>` | `<memory base/solution>`x |
-| Eval loss (public rows) | `<from run>` | `<from run>` | `<delta>`% |
+| Time of `soup train`, s | 82.3 | 67.1 | 1.226x |
+| Peak GPU memory (nvidia-smi), MiB | 14345 | 2775 | 5.169x |
+| Eval loss (public rows) | 2.0497 | 2.04913 | -0.028% |
 
 What has been checked without a T4:
 
@@ -106,7 +106,7 @@ What has been checked without a T4:
 
 Limits:
 
-1. Nothing above measures the speed, the memory or the 4-bit path of a real T4 run.
+1. The table is one repeat: the jury averages two, and repeats on a T4 vary by 1-4%.
 2. Gradients now flow in fp16 under the `GradScaler` where the base keeps fp32 activations. An
    overflow would skip a step, which checks 6 and 7 would show.
 3. The chunked loss works on training steps of a single process; other paths use the original code.

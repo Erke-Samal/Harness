@@ -43,7 +43,7 @@ _STEP_ATTR = "_soup_chunked_step"
 _ARMED_ATTR = "_skyxplorers_chunked_ce"
 _LAST_STEP_ATTR = "_skyxplorers_last_step"
 
-CE_CHUNK = 128
+CE_CHUNK = 32  # the workspace costs CE_CHUNK * 297 KiB at the peak
 _LOGITS_WORKSPACE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
