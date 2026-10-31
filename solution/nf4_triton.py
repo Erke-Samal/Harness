@@ -36,6 +36,9 @@ _SHIFT_MAP = {
     4096: 12,
 }
 
+_BLOCK_BYTES = 512
+_ARGS_ATTR = "_skyxplorers_launch_args"
+
 # Cache for per-device NF4 / FP4 float32 codebooks and temporary dequant buffer.
 _CODEBOOK_CACHE: dict[tuple[torch.device, str], torch.Tensor] = {}
 _DEQUANT_SCRATCH: dict[torch.device, torch.Tensor] = {}
@@ -118,6 +121,50 @@ def triton_nf4_dequant_kernel(
     tl.store(out_i32_ptr + byte_offs, packed_f16x2, mask=mask)
 
 
+def _launch_args(A: torch.Tensor, quant_state: Any) -> Optional[tuple]:
+    """Kernel arguments of one weight, or None if the kernel cannot unpack it.
+
+    A weight is unpacked hundreds of times per step and its state never changes, so they are built
+    once. Above all this reads ``offset`` from the GPU once: ``.item()`` waits for the whole queue.
+    """
+    cached = getattr(quant_state, _ARGS_ATTR, None)
+    if cached is not None and cached[0] == A.data_ptr():
+        return cached
+
+    b1 = int(quant_state.blocksize)
+    nested = bool(quant_state.nested)
+    b2 = int(quant_state.state2.blocksize) if nested else 64
+    if not A.is_cuda or b1 not in _SHIFT_MAP or (nested and b2 not in _SHIFT_MAP):
+        return None
+
+    qweight = A.contiguous().view(-1)
+    n_bytes = qweight.numel()
+    nf4_code = _get_codebook(quant_state.quant_type, A.device, getattr(quant_state, "code", None))
+    if nested:
+        state2_absmax = quant_state.state2.absmax.contiguous().view(-1)
+        state2_code = quant_state.state2.code.contiguous().view(-1)
+        qabsmax = quant_state.absmax.contiguous().view(-1)
+        absmax = state2_absmax
+        offset = quant_state.offset
+        offset = float(offset.item() if torch.is_tensor(offset) else offset or 0.0)
+    else:
+        absmax = state2_absmax = state2_code = quant_state.absmax.contiguous().view(-1)
+        qabsmax = qweight
+        offset = 0.0
+
+    constants = {
+        "SHIFT_B1": _SHIFT_MAP[b1],
+        "SHIFT_B2": _SHIFT_MAP[b2],
+        "NESTED": nested,
+        "BLOCK_BYTES": _BLOCK_BYTES,
+        "num_warps": 4,
+    }
+    grid = (triton.cdiv(n_bytes, _BLOCK_BYTES),)
+    args = (A.data_ptr(), grid, qweight, absmax, qabsmax, state2_absmax, state2_code, nf4_code, offset, n_bytes, constants)
+    setattr(quant_state, _ARGS_ATTR, args)
+    return args
+
+
 def triton_dequantize_nf4(
     A: torch.Tensor,
     quant_state: Any = None,
@@ -133,80 +180,30 @@ def triton_dequantize_nf4(
     if quant_state is None:
         return _orig_dequantize_4bit(A, None, absmax, out, blocksize, quant_type)
 
-    b1 = int(quant_state.blocksize)
-    nested = bool(quant_state.nested)
-    b2 = int(quant_state.state2.blocksize) if nested else 64
-
-    if not A.is_cuda or b1 not in _SHIFT_MAP or (nested and b2 not in _SHIFT_MAP):
+    launch = _launch_args(A, quant_state)
+    if launch is None:
         return _orig_dequantize_4bit(A, quant_state, absmax, out, blocksize, quant_type)
 
     target_dtype = quant_state.dtype if out is None else out.dtype
-    out_shape = tuple(quant_state.shape)
 
-    if out is None:
-        out_fp16 = torch.empty(out_shape, dtype=torch.float16, device=A.device)
-    elif out.dtype == torch.float16 and out.is_contiguous():
+    if out is not None and out.dtype == torch.float16 and out.is_contiguous():
         out_fp16 = out
     else:
-        out_fp16 = torch.empty(out_shape, dtype=torch.float16, device=A.device)
+        out_fp16 = torch.empty(tuple(quant_state.shape), dtype=torch.float16, device=A.device)
 
-    qweight_flat = A.contiguous().view(-1)
-    n_bytes = qweight_flat.numel()
-    out_i32 = out_fp16.view(-1).view(torch.int32)
-
-    nf4_code = _get_codebook(quant_state.quant_type, A.device, getattr(quant_state, "code", None))
-    shift_b1 = _SHIFT_MAP[b1]
-    shift_b2 = _SHIFT_MAP[b2]
-
-    if nested:
-        qabsmax = quant_state.absmax.contiguous().view(-1)
-        state2_absmax = quant_state.state2.absmax.contiguous().view(-1)
-        state2_code = quant_state.state2.code.contiguous().view(-1)
-        offset_val = float(quant_state.offset.item()) if torch.is_tensor(quant_state.offset) else float(quant_state.offset or 0.0)
-        dummy_f32 = state2_absmax
-    else:
-        absmax = quant_state.absmax.contiguous().view(-1)
-        dummy_u8 = qweight_flat
-        dummy_f32 = absmax
-        offset_val = 0.0
-
-    BLOCK_BYTES = 512
-    grid = (triton.cdiv(n_bytes, BLOCK_BYTES),)
-
-    if nested:
-        triton_nf4_dequant_kernel[grid](
-            qweight_flat,
-            dummy_f32,
-            qabsmax,
-            state2_absmax,
-            state2_code,
-            nf4_code,
-            out_i32,
-            offset_val,
-            n_bytes,
-            SHIFT_B1=shift_b1,
-            SHIFT_B2=shift_b2,
-            NESTED=True,
-            BLOCK_BYTES=BLOCK_BYTES,
-            num_warps=4,
-        )
-    else:
-        triton_nf4_dequant_kernel[grid](
-            qweight_flat,
-            absmax,
-            dummy_u8,
-            dummy_f32,
-            dummy_f32,
-            nf4_code,
-            out_i32,
-            0.0,
-            n_bytes,
-            SHIFT_B1=shift_b1,
-            SHIFT_B2=shift_b2,
-            NESTED=False,
-            BLOCK_BYTES=BLOCK_BYTES,
-            num_warps=4,
-        )
+    _, grid, qweight, absmax_f32, qabsmax, state2_absmax, state2_code, nf4_code, offset, n_bytes, constants = launch
+    triton_nf4_dequant_kernel[grid](
+        qweight,
+        absmax_f32,
+        qabsmax,
+        state2_absmax,
+        state2_code,
+        nf4_code,
+        out_fp16.view(-1).view(torch.int32),
+        offset,
+        n_bytes,
+        **constants,
+    )
 
     if out is not None and out.data_ptr() != out_fp16.data_ptr():
         out.copy_(out_fp16.to(out.dtype))
