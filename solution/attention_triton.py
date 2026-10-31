@@ -10,12 +10,16 @@ weights of all 28 layers until backward. This module replaces that path:
 * Autograd saves only Q, K and V. Backward rebuilds the weights for one layer at a time, and
   ``triton_causal_softmax_vjp_kernel`` applies the softmax vector-Jacobian product in place.
 
-Both kernels touch only ``col <= row``, and the online softmax follows Milakov and Gimelshein (2018).
+Both kernels touch only ``col <= row`` of the real tokens of a batch row. Q, K and the gradient of the
+output are zero on padding, so the scores there are already zero and the kernels skip those positions,
+which makes their work follow the real lengths instead of the longest row. The online softmax follows
+Milakov and Gimelshein (2018).
 """
 
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 import triton
@@ -27,71 +31,80 @@ _BLOCK = 64
 _MAX_FP16_GRAD = 16.0
 
 
-@triton.jit(do_not_specialize=["seq_len"])
+@triton.jit(do_not_specialize=["seq_len", "batch_rows"])
 def triton_causal_softmax_kernel(
     P_ptr,
+    Lengths_ptr,
     seq_len,
+    batch_rows,
     BLOCK: tl.constexpr,
 ):
     """In-place causal softmax over one ``[seq_len]`` row of scores per program."""
     row = tl.program_id(0)
     row_ptr = P_ptr + row * seq_len
+    n_tokens = tl.load(Lengths_ptr + row // batch_rows)
     n_valid = row % seq_len + 1
 
-    m_i = -float("inf")
-    d_i = 0.0
-    for start in range(0, n_valid, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        mask = cols < n_valid
-        x = tl.load(row_ptr + cols, mask=mask, other=-float("inf")).to(tl.float32)
-        m_new = tl.maximum(m_i, tl.max(x, axis=0))
-        d_i = d_i * tl.exp(m_i - m_new) + tl.sum(tl.where(mask, tl.exp(x - m_new), 0.0), axis=0)
-        m_i = m_new
+    if n_valid <= n_tokens:
+        m_i = -float("inf")
+        d_i = 0.0
+        for start in range(0, n_valid, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < n_valid
+            x = tl.load(row_ptr + cols, mask=mask, other=-float("inf")).to(tl.float32)
+            m_new = tl.maximum(m_i, tl.max(x, axis=0))
+            d_i = d_i * tl.exp(m_i - m_new) + tl.sum(tl.where(mask, tl.exp(x - m_new), 0.0), axis=0)
+            m_i = m_new
 
-    inv_d = 1.0 / d_i
-    for start in range(0, seq_len, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        mask = cols < seq_len
-        x = tl.load(row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        prob = tl.where(cols < n_valid, tl.exp(x - m_i) * inv_d, 0.0)
-        tl.store(row_ptr + cols, prob.to(P_ptr.dtype.element_ty), mask=mask)
+        inv_d = 1.0 / d_i
+        for start in range(0, n_tokens, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < n_tokens
+            x = tl.load(row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            prob = tl.where(cols < n_valid, tl.exp(x - m_i) * inv_d, 0.0)
+            tl.store(row_ptr + cols, prob.to(P_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit(do_not_specialize=["seq_len"])
+@triton.jit(do_not_specialize=["seq_len", "batch_rows"])
 def triton_causal_softmax_vjp_kernel(
     P_ptr,
     G_ptr,
+    Lengths_ptr,
     seq_len,
+    batch_rows,
     BLOCK: tl.constexpr,
 ):
     """In-place ``g = p * (g - sum(p * g))`` over one causal row per program."""
     row = tl.program_id(0)
     p_ptr = P_ptr + row * seq_len
     g_ptr = G_ptr + row * seq_len
+    n_tokens = tl.load(Lengths_ptr + row // batch_rows)
     n_valid = row % seq_len + 1
 
-    dot = 0.0
-    for start in range(0, n_valid, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        mask = cols < n_valid
-        p = tl.load(p_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        dot += tl.sum(p * g, axis=0)
+    if n_valid <= n_tokens:
+        dot = 0.0
+        for start in range(0, n_valid, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < n_valid
+            p = tl.load(p_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            dot += tl.sum(p * g, axis=0)
 
-    for start in range(0, seq_len, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        mask = cols < seq_len
-        p = tl.load(p_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        tl.store(g_ptr + cols, (p * (g - dot)).to(G_ptr.dtype.element_ty), mask=mask)
+        for start in range(0, n_tokens, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < n_tokens
+            p = tl.load(p_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            tl.store(g_ptr + cols, (p * (g - dot)).to(G_ptr.dtype.element_ty), mask=mask)
 
 
-def _causal_weights(q_groups: torch.Tensor, k_scaled: torch.Tensor) -> torch.Tensor:
+def _causal_weights(q_groups: torch.Tensor, k_scaled: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Causal attention weights ``[B, Hk, r * S, S]`` from grouped Q and scaled K."""
     weights = torch.matmul(q_groups, k_scaled.transpose(-1, -2))
     seq_len = weights.shape[-1]
-    triton_causal_softmax_kernel[(weights.numel() // seq_len,)](
-        weights, seq_len, BLOCK=_BLOCK, num_warps=2
+    rows = weights.numel() // seq_len
+    triton_causal_softmax_kernel[(rows,)](
+        weights, lengths, seq_len, rows // lengths.numel(), BLOCK=_BLOCK, num_warps=2
     )
     return weights
 
@@ -102,16 +115,18 @@ def _attention_vjp(
     v: torch.Tensor,
     dy: torch.Tensor,
     scaling: float,
+    lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gradients for grouped Q, K and V, given the gradient of the grouped output."""
     k_scaled = k * scaling
-    weights = _causal_weights(q_groups, k_scaled)
+    weights = _causal_weights(q_groups, k_scaled, lengths)
     dv = torch.matmul(weights.transpose(-1, -2), dy)
 
     grad_weights = torch.matmul(dy, v.transpose(-1, -2))
     seq_len = weights.shape[-1]
-    triton_causal_softmax_vjp_kernel[(weights.numel() // seq_len,)](
-        weights, grad_weights, seq_len, BLOCK=_BLOCK, num_warps=2
+    rows = weights.numel() // seq_len
+    triton_causal_softmax_vjp_kernel[(rows,)](
+        weights, grad_weights, lengths, seq_len, rows // lengths.numel(), BLOCK=_BLOCK, num_warps=2
     )
     del weights
 
@@ -121,22 +136,23 @@ def _attention_vjp(
 
 
 def _is_finite(*tensors: torch.Tensor) -> bool:
-    return all(torch.isfinite(t.sum(dtype=torch.float32)) for t in tensors)
+    return bool(torch.isfinite(sum(t.sum(dtype=torch.float32) for t in tensors)))
 
 
 class _TritonCausalGQAFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, scaling):
+    def forward(ctx, q, k, v, scaling, lengths):
         # q: [B, H, S, D], k and v: [B, Hk, S, D], all contiguous, H divisible by Hk
         batch, n_heads, seq_len, head_dim = q.shape
         n_kv_heads = k.shape[1]
         q_groups = q.view(batch, n_kv_heads, n_heads // n_kv_heads * seq_len, head_dim)
 
-        weights = _causal_weights(q_groups, k * scaling)
+        weights = _causal_weights(q_groups, k * scaling, lengths)
         out = torch.matmul(weights, v)
 
         ctx.save_for_backward(q, k, v)
         ctx.scaling = scaling
+        ctx.lengths = lengths
         return out
 
     @staticmethod
@@ -151,13 +167,13 @@ class _TritonCausalGQAFunction(torch.autograd.Function):
         rescale = 1.0
         if _MAX_FP16_GRAD < peak < math.inf:
             rescale = 2.0 ** math.ceil(math.log2(peak / _MAX_FP16_GRAD))
-        dq, dk, dv = _attention_vjp(q_groups, k, v, dy / rescale, ctx.scaling)
+        dq, dk, dv = _attention_vjp(q_groups, k, v, dy / rescale, ctx.scaling, ctx.lengths)
         if not _is_finite(dq, dk, dv):
             dq, dk, dv = _attention_vjp(
-                q_groups.float(), k.float(), v.float(), dy.float() / rescale, ctx.scaling
+                q_groups.float(), k.float(), v.float(), dy.float() / rescale, ctx.scaling, ctx.lengths
             )
         dq, dk, dv = (g.to(q.dtype) * rescale for g in (dq, dk, dv))
-        return dq.view_as(q), dk, dv, None
+        return dq.view_as(q), dk, dv, None, None
 
 
 def triton_causal_gqa_attention(
@@ -165,11 +181,17 @@ def triton_causal_gqa_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scaling: float,
+    lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Causal GQA attention over ``[B, H, S, D]`` Q and ``[B, Hk, S, D]`` K and V: ``[B, S, H * D]``."""
+    """Causal GQA attention over ``[B, H, S, D]`` Q and ``[B, Hk, S, D]`` K and V: ``[B, S, H * D]``.
+
+    ``lengths`` is the int32 ``[B]`` count of real tokens, with Q, K and V zero after them.
+    """
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     batch, n_heads, seq_len, head_dim = q.shape
-    out = _TritonCausalGQAFunction.apply(q, k, v, scaling)
+    if lengths is None:
+        lengths = q.new_full((batch,), seq_len, dtype=torch.int32)
+    out = _TritonCausalGQAFunction.apply(q, k, v, scaling, lengths)
     return out.view(batch, n_heads, seq_len, head_dim).transpose(1, 2).reshape(batch, seq_len, -1)
 
 
@@ -194,7 +216,7 @@ def patch_qwen2_attention() -> None:
 
         cos, sin = position_embeddings
         q, k = modeling_qwen2.apply_rotary_pos_emb(q, k, cos, sin)
-        out = triton_causal_gqa_attention(q, k, v, self.scaling)
+        out = triton_causal_gqa_attention(q, k, v, self.scaling, packing.lengths)
         return self.o_proj(pack_tokens(out, packing)), None
 
     def _fast_attention_forward(

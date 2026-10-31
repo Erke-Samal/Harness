@@ -23,6 +23,7 @@ class TokenPacking:
     """Where the real tokens of a batch live on its ``[B, S]`` grid."""
 
     index: torch.Tensor  # [N], flat grid position of each real token
+    lengths: torch.Tensor  # [B], int32 count of real tokens per row
     batch: int
     seq_len: int
 
@@ -123,4 +124,4 @@ def plan_token_packing(
     if not bool(mask[:, 0].all() and (mask[:, :-1] >= mask[:, 1:]).all()):
         return None
     index = mask.view(-1).nonzero().squeeze(1)
-    return TokenPacking(index, attention_mask.shape[0], attention_mask.shape[1])
+    return TokenPacking(index, mask.sum(1, dtype=torch.int32), attention_mask.shape[0], attention_mask.shape[1])

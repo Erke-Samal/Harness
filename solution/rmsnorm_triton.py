@@ -8,8 +8,10 @@ call (57 times per forward pass).
 
 Our ``triton_rmsnorm_fwd_kernel`` and ``triton_rmsnorm_bwd_kernel`` compute the
 normalization and affine scale in ``float32`` registers for full numerical
-precision, and write the output in ``x.dtype`` (``float16``), saving only ``x``
-and the 1D inverse-RMS vector ``rstd`` (``[M]`` in ``float32``) for backward.
+precision, and write the output in ``x.dtype`` (``float16``). Backward needs ``x / rms``,
+which is ``y / weight``, so autograd keeps ``y`` instead of ``x``: the input norm's ``y``
+is kept by the LoRA layers anyway, and ``x`` can be freed with the residual. Only the 1D
+inverse-RMS vector ``rstd`` (``[M]`` in ``float32``) is added.
 """
 
 from __future__ import annotations
@@ -52,13 +54,13 @@ def triton_rmsnorm_fwd_kernel(
 @triton.jit
 def triton_rmsnorm_bwd_kernel(
     DY_ptr,
-    X_ptr,
+    Y_ptr,
     W_ptr,
     RSTD_ptr,
     DX_ptr,
     DW_ptr,
     stride_dy_row,
-    stride_x_row,
+    stride_y_row,
     stride_dx_row,
     n_cols,
     HAS_DW: tl.constexpr,
@@ -70,11 +72,11 @@ def triton_rmsnorm_bwd_kernel(
     mask = cols < n_cols
 
     dy = tl.load(DY_ptr + row_idx * stride_dy_row + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(X_ptr + row_idx * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    y = tl.load(Y_ptr + row_idx * stride_y_row + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row_idx).to(tl.float32)
 
-    x_hat = x * rstd
+    x_hat = tl.where(w != 0.0, y / w, 0.0)
     wdy = w * dy
     c1 = tl.sum(x_hat * wdy, axis=0) / n_cols
     dx = (wdy - x_hat * c1) * rstd
@@ -123,7 +125,7 @@ class _TritonRMSNormFunction(torch.autograd.Function):
             num_warps=num_warps,
         )
 
-        ctx.save_for_backward(x_2d, w_1d, rstd)
+        ctx.save_for_backward(y_2d, w_1d, rstd)
         ctx.orig_shape = orig_shape
         ctx.n_cols = n_cols
         ctx.block_n = block_n
@@ -133,28 +135,28 @@ class _TritonRMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_2d, w_1d, rstd = ctx.saved_tensors
+        y_2d, w_1d, rstd = ctx.saved_tensors
         n_cols = ctx.n_cols
-        n_rows = x_2d.shape[0]
+        n_rows = y_2d.shape[0]
 
         dy_2d = grad_output.contiguous().view(-1, n_cols)
-        dx_2d = torch.empty_like(x_2d)
+        dx_2d = torch.empty_like(y_2d)
 
         need_dw = bool(ctx.needs_input_grad[1])
         if need_dw:
-            dw_f32 = torch.zeros(n_cols, dtype=torch.float32, device=x_2d.device)
+            dw_f32 = torch.zeros(n_cols, dtype=torch.float32, device=y_2d.device)
         else:
             dw_f32 = rstd  # dummy pointer, unused when HAS_DW=False
 
         triton_rmsnorm_bwd_kernel[(n_rows,)](
             dy_2d,
-            x_2d,
+            y_2d,
             w_1d,
             rstd,
             dx_2d,
             dw_f32,
             dy_2d.stride(0),
-            x_2d.stride(0),
+            y_2d.stride(0),
             dx_2d.stride(0),
             n_cols,
             HAS_DW=need_dw,

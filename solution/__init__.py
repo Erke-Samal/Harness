@@ -90,7 +90,12 @@ def _patch_soup_sft_setup() -> None:
         return
 
     def _wrapped_setup_transformers(self, *args, **kwargs):
-        result = orig_setup(self, *args, **kwargs)
+        # Loading builds many long-lived objects and frees few: the collector only rescans them.
+        gc.disable()
+        try:
+            result = orig_setup(self, *args, **kwargs)
+        finally:
+            gc.enable()
         model = getattr(self, "model", None)
         if not isinstance(model, torch.nn.Module):
             return result
@@ -118,6 +123,7 @@ def _patch_soup_sft_setup() -> None:
         if cast_any:
             gc.collect()
             torch.cuda.empty_cache()
+        gc.freeze()  # the model never becomes garbage: training steps need not rescan it
 
         return result
 
@@ -131,6 +137,7 @@ def apply() -> None:
     if _APPLIED:
         return
 
+    gc.disable()  # the imports below create objects that live until the process exits
     patch_qwen2_mlp()
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
@@ -140,5 +147,6 @@ def apply() -> None:
     _patch_qwen2_causal_attention_mask()
     _patch_soup_sft_setup()
     start_compiling()
+    gc.enable()
 
     _APPLIED = True

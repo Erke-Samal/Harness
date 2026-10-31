@@ -31,9 +31,9 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
 |---|---|---|
 | `solution/nf4_triton.py` | `triton_nf4_dequant_kernel` | One launch for double-quantized NF4/FP4 unpacking: nested `absmax`, both nibbles, the codebook, pairs of fp16 written as one 32-bit word, into one reusable buffer. Autograd functions for `bnb.nn.Linear4bit` and the peft LoRA layer avoid `result.clone()` and keep the dropout mask in `uint8`. |
 | `solution/cross_entropy_triton.py` | `triton_vocab_ce_entropy_bwd_kernel` | Chunks of 32 positions in one reused workspace. One row pass gives cross-entropy, Shannon entropy and argmax by an online softmax; a second pass overwrites the chunk with `softmax - one_hot`. Full logits are never built on a training step. |
-| `solution/rmsnorm_triton.py` | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | RMSNorm in fp32 registers with output in the input's dtype, which stops the fp32 cascade. Saves `x` and a 1D `rstd`. |
+| `solution/rmsnorm_triton.py` | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | RMSNorm in fp32 registers with output in the input's dtype, which stops the fp32 cascade. Saves its output, which the LoRA layers keep anyway, and a 1D `rstd`: backward gets `x / rms` as `y / weight`. |
 | `solution/rope_triton.py` | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | Q and K rotary embedding in one launch, reading the non-contiguous views directly. Backward saves only `cos` and `sin`. |
-| `solution/attention_triton.py` | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | Causal GQA attention in fp16 instead of PyTorch's fp32 math path. Query heads that share a key head form one matrix, so K and V are never repeated. Autograd saves Q, K and V only: the `[B, H, S, S]` weights are rebuilt in backward, one layer at a time. |
+| `solution/attention_triton.py` | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | Causal GQA attention in fp16 instead of PyTorch's fp32 math path. Query heads that share a key head form one matrix, so K and V are never repeated. The softmax skips the zero scores of padding, so its work follows the real lengths. Autograd saves Q, K and V only: the `[B, H, S, S]` weights are rebuilt in backward, one layer at a time. |
 | `solution/token_packing.py` | `triton_token_copy_kernel` | Pad-free steps: norms and linear layers see `[1, N, W]` real tokens, and only attention copies them to a `[B, S, W]` grid. Rows stay in their own batch and order. |
 | `solution/swiglu.py` | `triton_swiglu_compress_fwd_kernel`, `triton_swiglu_decompress_bwd_kernel` | One launch computes the exact output and keeps `silu(gate)` and `silu'(gate) * up` for backward as int8 with one scale per 256 columns, half of what autograd would keep. Only gradients are rounded (cosine similarity to exact gradients on random data: 0.9999). |
 
@@ -114,7 +114,8 @@ Limits:
    registers.
 5. The fast LoRA path covers one vanilla adapter; DoRA, several adapters and merged layers use
    peft's original forward. Unusual masks (left padding, gaps) keep the 2D mask.
-6. Attention still runs on the `[B, S]` grid, so its cost follows the longest row of a batch.
+6. The matrix multiplies of attention still run on the `[B, S]` grid, so their cost follows the
+   longest row of a batch; only the softmax follows the real lengths.
    Backward computes the weights a second time, which costs time to save memory.
 7. Attention sums in fp16 are less exact than the base's fp32. Backward redoes a layer in fp32 when
    an overflow appears, and checks 6 and 7 compare the outputs with the base.

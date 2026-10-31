@@ -32,7 +32,8 @@ def _tensor(shape: tuple[int, ...], device: torch.device, grad: bool = True) -> 
 def compile_kernels(device: torch.device) -> None:
     """Launch every kernel once, forward and backward, on tiny fp16 tensors."""
     seq_len = 2
-    packing = TokenPacking(torch.arange(seq_len, device=device), 1, seq_len)
+    index = torch.arange(seq_len, device=device)
+    packing = TokenPacking(index, torch.tensor([seq_len], dtype=torch.int32, device=device), 1, seq_len)
 
     x = _tensor((1, seq_len, _HIDDEN), device)
     weight = torch.ones(_HIDDEN, dtype=torch.float32, device=device)  # norms stay in fp32

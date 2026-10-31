@@ -235,12 +235,47 @@ def test_causal_gqa_attention_matches_sdpa(dtype: torch.dtype, seq_len: int) -> 
     torch.testing.assert_close(v.grad.float(), v_ref.grad, atol=atol, rtol=rtol)
 
 
+def test_attention_on_a_padded_batch_matches_each_row_alone() -> None:
+    lengths = torch.tensor([65, 2, 9], dtype=torch.int32, device="cuda")
+    batch, n_heads, n_kv_heads, seq_len, head_dim = 3, 12, 2, 65, 32
+    scaling = head_dim**-0.5
+    position = torch.arange(seq_len, device="cuda")
+    keep = (position < lengths[:, None])[:, None, :, None].float()
+    q = (torch.randn((batch, n_heads, seq_len, head_dim), device="cuda") * keep).requires_grad_(True)
+    k = (torch.randn((batch, n_kv_heads, seq_len, head_dim), device="cuda") * keep).requires_grad_(True)
+    v = (torch.randn((batch, n_kv_heads, seq_len, head_dim), device="cuda") * keep).requires_grad_(True)
+    weight = torch.randn((batch, seq_len, n_heads * head_dim), device="cuda") * keep[:, 0]
+
+    out = triton_causal_gqa_attention(q, k, v, scaling, lengths)
+    (out * weight).sum().backward()
+
+    repeats = n_heads // n_kv_heads
+    for row, length in enumerate(lengths.tolist()):
+        q_row = q[row : row + 1, :, :length].detach().requires_grad_(True)
+        k_row = k[row : row + 1, :, :length].detach().requires_grad_(True)
+        v_row = v[row : row + 1, :, :length].detach().requires_grad_(True)
+        out_row = F.scaled_dot_product_attention(
+            q_row,
+            k_row.repeat_interleave(repeats, dim=1),
+            v_row.repeat_interleave(repeats, dim=1),
+            is_causal=True,
+            scale=scaling,
+        )
+        out_row = out_row.transpose(1, 2).reshape(1, length, -1)
+        torch.testing.assert_close(out[row, :length], out_row[0], atol=1e-4, rtol=1e-4)
+        (out_row * weight[row : row + 1, :length]).sum().backward()
+        torch.testing.assert_close(q.grad[row, :, :length], q_row.grad[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(k.grad[row, :, :length], k_row.grad[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(v.grad[row, :, :length], v_row.grad[0], atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("width", [256, 1536, 4000])
 def test_token_packing_round_trip_and_gradients(width: int) -> None:
     mask = torch.zeros((3, 9), dtype=torch.bool, device="cuda")
     for row, length in enumerate((9, 4, 6)):
         mask[row, :length] = True
-    packing = TokenPacking(mask.view(-1).nonzero().squeeze(1), 3, 9)
+    lengths = mask.sum(1, dtype=torch.int32)
+    packing = TokenPacking(mask.view(-1).nonzero().squeeze(1), lengths, 3, 9)
     packed = torch.randn((1, packing.index.numel(), width), device="cuda", dtype=torch.float16).requires_grad_(True)
 
     grid = unpack_tokens(packed, packing)
