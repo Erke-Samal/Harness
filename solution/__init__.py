@@ -28,7 +28,8 @@ import torch
 
 from solution.attention_triton import patch_qwen2_attention
 from solution.cross_entropy_triton import arm_chunked_ce, patch_chunked_ce_loss
-from solution.nf4_triton import offload_packed_weights, patch_nf4_and_lora
+from solution.host_loading import loading_to_host, patch_model_loading, place_loaded_model
+from solution.nf4_triton import patch_nf4_and_lora
 from solution.precompile import start_compiling
 from solution.rmsnorm_triton import patch_qwen2_rmsnorm
 from solution.rope_triton import patch_qwen2_rope
@@ -91,11 +92,13 @@ def _patch_soup_sft_setup() -> None:
         return
 
     def _wrapped_setup_transformers(self, *args, **kwargs):
-        result = orig_setup(self, *args, **kwargs)
+        with loading_to_host():
+            result = orig_setup(self, *args, **kwargs)
         model = getattr(self, "model", None)
         if not isinstance(model, torch.nn.Module):
             return result
-        if not any(p.is_cuda for p in model.parameters()):
+        device = next((p.device for p in model.parameters() if p.is_cuda), None)
+        if device is None:
             return result
 
         # 1. Restore frozen non-norm fp32 weights (embed_tokens, lm_head, frozen biases)
@@ -113,10 +116,10 @@ def _patch_soup_sft_setup() -> None:
 
         # 2. Full [B, S, V] logits are never materialized on a labelled training step.
         causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
-        if isinstance(causal_lm, modeling_qwen2.Qwen2ForCausalLM):
+        is_qwen2 = isinstance(causal_lm, modeling_qwen2.Qwen2ForCausalLM)
+        place_loaded_model(model, device, is_qwen2)
+        if is_qwen2:
             arm_chunked_ce(causal_lm)
-
-        offload_packed_weights(model)
 
         if cast_any:
             gc.collect()
@@ -149,6 +152,7 @@ def apply() -> None:
     patch_qwen2_rope()
     patch_qwen2_attention()
     patch_nf4_and_lora()
+    patch_model_loading()
     patch_chunked_ce_loss()
     _patch_qwen2_causal_attention_mask()
     _patch_soup_sft_setup()

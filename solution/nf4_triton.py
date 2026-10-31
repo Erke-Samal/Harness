@@ -99,17 +99,16 @@ def _fetch_packed(host: torch.Tensor, device: torch.device) -> torch.Tensor:
     return packed
 
 
-def offload_packed_weights(model: torch.nn.Module) -> None:
-    """Keep the packed bytes of every 4-bit weight in pinned host memory; values do not change."""
-    import bitsandbytes as bnb
+def offload_packed_weight(weight: torch.Tensor) -> None:
+    """Keep the packed bytes of a 4-bit weight in pinned host memory; its values do not change."""
+    host = weight.data.to("cpu").pin_memory()
+    setattr(weight.quant_state, _HOST_ATTR, host)
+    weight.data = host
 
-    for module in model.modules():
-        weight = getattr(module, "weight", None)
-        if not isinstance(module, bnb.nn.Linear4bit) or getattr(weight, "quant_state", None) is None:
-            continue
-        host = weight.data.to("cpu").pin_memory()
-        setattr(weight.quant_state, _HOST_ATTR, host)
-        weight.data = host
+
+def restore_packed_weight(weight: torch.Tensor) -> None:
+    weight.data = weight.data.to(_weight_device(weight.quant_state))
+    setattr(weight.quant_state, _HOST_ATTR, None)
 
 
 @triton.jit(do_not_specialize=["n_bytes"])
