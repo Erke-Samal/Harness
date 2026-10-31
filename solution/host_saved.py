@@ -8,7 +8,6 @@ Allowed by the organizer's answers; backward stays complete and its values do no
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -16,7 +15,7 @@ import torch
 _SLAB_BYTES = 1 << 31  # a slab that fills up leaves further values on the GPU
 _MIN_BYTES = 1 << 20  # smaller values cost more in copies than they free
 _ALIGN = 64
-_STEP_BUDGET_BYTES = int(os.environ.get("SKY_BUDGET", "300")) << 20  # only what exceeds it moves
+_STEP_BUDGET_BYTES = 300 << 20  # only what exceeds it moves
 
 _slab: Optional[torch.Tensor] = None
 _used = 0
