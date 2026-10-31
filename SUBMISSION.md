@@ -21,17 +21,17 @@
 | `triton_rmsnorm_fwd_kernel`, `triton_rmsnorm_bwd_kernel` | `solution/rmsnorm_triton.py` | `Qwen2RMSNorm.forward` and its backward | % |
 | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | `solution/rope_triton.py` | `apply_rotary_pos_emb` and its backward | % |
 | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | `solution/attention_triton.py` | the fp32 math path of `scaled_dot_product_attention` and its backward | % |
+| `triton_swiglu_compress_fwd_kernel`, `triton_swiglu_decompress_bwd_kernel` | `solution/swiglu.py` | SwiGLU and the fp16 `gate` and `up` that autograd keeps for backward | % |
 | `triton_token_copy_kernel` | `solution/token_packing.py` | padded layers: copies real tokens to and from the attention grid | % |
 
-`triton_swiglu_2d_fwd_kernel` and `triton_swiglu_2d_bwd_kernel` in `solution/swiglu.py` are a rewrite
-of the kit's example and are not claimed as our own kernels.
+The kit's example SwiGLU kernels are no longer used.
 
 Ideas taken from other kernels, with links (we wrote the code ourselves):
 - Online softmax: Milakov and Gimelshein (2018), https://arxiv.org/abs/1805.02867
 - Chunked head and loss, and the per-token data layout: Soup's `soup_cli/utils/stream_loss_chunk.py`,
   https://github.com/MakazhanAlpamys/Soup
 - Recomputing values in backward: Chen et al. (2016), https://arxiv.org/abs/1604.06174
-- Removing pads inside a batch: the hints of the task statement
+- Removing pads inside a batch, activation compression: the hints of the task statement
 - NF4 and double quantization: Dettmers et al. (2023), https://arxiv.org/abs/2305.14314, and
   `bitsandbytes`
 

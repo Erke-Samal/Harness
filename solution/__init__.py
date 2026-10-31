@@ -12,9 +12,8 @@ supporting QLoRA / Soup SFT wiring:
      ``fp16`` hidden state dtype.
   4. ``solution.rope_triton``: Fused 2D Q+K Rotary Position Embedding forward/backward
      (``triton_rope_qk_fwd_kernel``, ``triton_rope_qk_bwd_kernel``).
-  5. ``solution.swiglu``: 2D multi-row tiled SwiGLU forward/backward with backward
-     activation recomputation (``triton_swiglu_2d_fwd_kernel``,
-     ``triton_swiglu_2d_bwd_kernel``).
+  5. ``solution.swiglu``: SwiGLU with int8 backward state
+     (``triton_swiglu_compress_fwd_kernel``, ``triton_swiglu_decompress_bwd_kernel``).
   6. ``solution.attention_triton``: fp16 causal GQA attention with weights rebuilt in
      backward (``triton_causal_softmax_kernel``, ``triton_causal_softmax_vjp_kernel``).
   7. ``solution.token_packing``: pad-free training steps (``triton_token_copy_kernel``).

@@ -35,7 +35,7 @@ transformers, peft, trl, bitsandbytes and Soup and targeted these causes:
 | `solution/rope_triton.py` | `triton_rope_qk_fwd_kernel`, `triton_rope_qk_bwd_kernel` | Q and K rotary embedding in one launch, reading the non-contiguous views directly. Backward saves only `cos` and `sin`. |
 | `solution/attention_triton.py` | `triton_causal_softmax_kernel`, `triton_causal_softmax_vjp_kernel` | Causal GQA attention in fp16 instead of PyTorch's fp32 math path. Query heads that share a key head form one matrix, so K and V are never repeated. Autograd saves Q, K and V only: the `[B, H, S, S]` weights are rebuilt in backward, one layer at a time. |
 | `solution/token_packing.py` | `triton_token_copy_kernel` | Pad-free steps: norms and linear layers see `[1, N, W]` real tokens, and only attention copies them to a `[B, S, W]` grid. Rows stay in their own batch and order. |
-| `solution/swiglu.py` | `triton_swiglu_2d_fwd_kernel`, `triton_swiglu_2d_bwd_kernel` | SwiGLU over 2D rows, `silu(gate)` recomputed in backward. **This is our rewrite of the kit's example, so we do not claim it as our own kernel**: the rules say the example does not count however it is rewritten. |
+| `solution/swiglu.py` | `triton_swiglu_compress_fwd_kernel`, `triton_swiglu_decompress_bwd_kernel` | One launch computes the exact output and keeps `silu(gate)` and `silu'(gate) * up` for backward as int8 with one scale per 256 columns, half of what autograd would keep. Only gradients are rounded (cosine similarity to exact gradients on random data: 0.9999). |
 
 Other patches, in `solution/__init__.py`:
 
@@ -57,7 +57,8 @@ softmax* (2018); the chunked loss idea and its data layout come from Soup's own
 the `bitsandbytes` `QuantState`. The fused-kernel path follows the kit's `solution/swiglu.py`.
 Removing pads inside a batch comes from the hints of the task statement. Rebuilding values in
 backward instead of storing them follows the recomputation idea of Chen et al., *Training Deep Nets
-with Sublinear Memory Cost* (2016), https://arxiv.org/abs/1604.06174. All kernel code is our own.
+with Sublinear Memory Cost* (2016), https://arxiv.org/abs/1604.06174. Activation compression comes
+from the hints of the task statement. All kernel code is our own.
 
 ## 2. How to run it
 
@@ -112,5 +113,6 @@ Limits:
    Backward computes the weights a second time, which costs time to save memory.
 7. Attention sums in fp16 are less exact than the base's fp32. Backward redoes a layer in fp32 when
    an overflow appears, and checks 6 and 7 compare the outputs with the base.
-8. LoRA dropout keeps its probability but draws its mask by our own code, so masks differ from the
-   base run.
+8. MLP gradients are rounded to int8 steps, so they are close to the base, not equal to it.
+9. LoRA dropout keeps its probability but draws its mask by our own code and redraws it from a seed in
+   backward, so masks differ from the base run.

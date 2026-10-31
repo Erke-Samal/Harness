@@ -45,8 +45,10 @@ def test_swiglu_2d_matches_pytorch(dtype: torch.dtype, shape: tuple[int, ...]) -
     out.backward(grad_out)
     out_ref.backward(grad_out)
 
-    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=atol, rtol=rtol)
-    torch.testing.assert_close(up.grad, up_ref.grad, atol=atol, rtol=rtol)
+    # The backward state is int8: a step of the largest tile value, times |grad_out| <= about 5.
+    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=0.15, rtol=0.0)
+    torch.testing.assert_close(up.grad, up_ref.grad, atol=0.15, rtol=0.0)
+    assert (gate.grad - gate_ref.grad).abs().mean() < 0.02
 
 
 @pytest.mark.parametrize("x_dtype", [torch.float16, torch.float32])
