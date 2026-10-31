@@ -106,6 +106,15 @@ def offload_packed_weight(weight: torch.Tensor) -> None:
     weight.data = host
 
 
+def drop_gpu_copies(model: torch.nn.Module) -> None:
+    """Moving the model while the trainer prepares it brings packed weights back: only the host copy stays."""
+    for param in model.parameters():
+        state = getattr(param, "quant_state", None)
+        host = getattr(state, _HOST_ATTR, None)
+        if host is not None and param.is_cuda:
+            param.data = host
+
+
 def restore_packed_weight(weight: torch.Tensor) -> None:
     weight.data = weight.data.to(_weight_device(weight.quant_state))
     setattr(weight.quant_state, _HOST_ATTR, None)

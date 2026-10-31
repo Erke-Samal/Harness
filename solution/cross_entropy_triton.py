@@ -36,6 +36,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from solution.host_saved import saved_on_host
+from solution.nf4_triton import drop_gpu_copies
 from solution.token_packing import TokenPacking, plan_token_packing, set_active_packing
 
 # The attribute under which Soup's rewind recorder looks for per-token losses.
@@ -355,6 +357,7 @@ def _log_trl_metrics(trainer: Any, inputs: dict[str, Any], step: ChunkStep) -> N
 
 
 _PATCHED_CE = False
+_FIRST_STEP_DONE_ATTR = "_skyxplorers_first_step_done"
 
 
 def patch_chunked_ce_loss() -> None:
@@ -382,6 +385,14 @@ def patch_chunked_ce_loss() -> None:
         ):
             return orig_forward(self, *args, **kwargs)
 
+        if not getattr(self, _FIRST_STEP_DONE_ATTR, False):
+            setattr(self, _FIRST_STEP_DONE_ATTR, True)
+            before = torch.cuda.memory_allocated()
+            drop_gpu_copies(self)
+            torch.cuda.empty_cache()
+            print("DIAG", before >> 20, torch.cuda.memory_allocated() >> 20, torch.cuda.memory_reserved() >> 20, torch.cuda.max_memory_allocated() >> 20, flush=True)
+            torch.cuda.reset_peak_memory_stats()
+
         labels = kwargs.pop("labels")
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
         kwargs.pop("logits_to_keep", None)
@@ -403,7 +414,8 @@ def patch_chunked_ce_loss() -> None:
             )
             set_active_packing(packing)
             try:
-                outputs = self.model(**kwargs)
+                with saved_on_host(device):
+                    outputs = self.model(**kwargs)
             finally:
                 set_active_packing(None)
 
