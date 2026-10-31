@@ -38,6 +38,7 @@ def patch_model_loading() -> None:
         return
 
     import bitsandbytes as bnb
+    import peft
     from transformers import core_model_loading, modeling_utils
 
     orig_get_device = core_model_loading.get_device
@@ -60,6 +61,22 @@ def patch_model_loading() -> None:
     def _warmup(*args: Any, **kwargs: Any) -> None:
         if not _loading:
             orig_warmup(*args, **kwargs)
+
+    orig_prepare = peft.prepare_model_for_kbit_training
+
+    def _prepare(model: Any, *args: Any, **kwargs: Any) -> Any:
+        """The embedding would widen to fp32 only to return to fp16: it stays out of that loop."""
+        embedding = model.get_input_embeddings().weight
+        if not _loading or embedding.is_cuda:
+            return orig_prepare(model, *args, **kwargs)
+        kept = embedding.data.to(torch.float16)
+        embedding.data = kept[:0]
+        try:
+            return orig_prepare(model, *args, **kwargs)
+        finally:
+            embedding.data = kept
+
+    peft.prepare_model_for_kbit_training = _prepare
 
     orig_param_to = bnb.nn.Params4bit.to
 

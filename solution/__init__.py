@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gc
 import importlib.metadata
+import sys
 
 import torch
 
@@ -144,6 +145,10 @@ def apply() -> None:
     global _APPLIED
     if _APPLIED:
         return
+
+    # Nothing in ``soup train`` uses them, and they would be imported only to be checked for.
+    sys.modules["wandb"] = None
+    sys.modules["sklearn"] = None
 
     scan_packages = importlib.metadata.packages_distributions
     _reuse_package_scan()

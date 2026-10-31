@@ -356,7 +356,6 @@ def _log_trl_metrics(trainer: Any, inputs: dict[str, Any], step: ChunkStep) -> N
 
 
 _PATCHED_CE = False
-_FIRST_STEP_DONE_ATTR = "_skyxplorers_first_step_done"
 
 
 def patch_chunked_ce_loss() -> None:
@@ -383,13 +382,6 @@ def patch_chunked_ce_loss() -> None:
             or kwargs.get("logits_to_keep", 0) != 0
         ):
             return orig_forward(self, *args, **kwargs)
-
-        if not getattr(self, _FIRST_STEP_DONE_ATTR, False):
-            setattr(self, _FIRST_STEP_DONE_ATTR, True)
-            before = torch.cuda.memory_allocated()
-            torch.cuda.empty_cache()
-            print("DIAG", before >> 20, torch.cuda.memory_allocated() >> 20, torch.cuda.memory_reserved() >> 20, torch.cuda.max_memory_allocated() >> 20, flush=True)
-            torch.cuda.reset_peak_memory_stats()
 
         labels = kwargs.pop("labels")
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
